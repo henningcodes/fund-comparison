@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.figure_factory as ff
 import plotly.graph_objects as go
 from scipy.cluster.hierarchy import linkage
+from scipy.optimize import minimize
 from scipy.spatial.distance import squareform
 import yfinance as yf
 
@@ -280,6 +281,227 @@ def return_dendrogram(prices):
     return fig
 
 
+def stress_test_table(prices, benchmark_name, n_worst=5):
+    """Find the worst n weeks for the benchmark and show all funds' returns."""
+    # Compute weekly returns (Friday-to-Friday)
+    weekly = prices.resample("W-FRI").last()
+    weekly_rets = weekly.pct_change().dropna(how="all")
+
+    if benchmark_name not in weekly_rets.columns:
+        return None
+
+    bench_weekly = weekly_rets[benchmark_name].dropna()
+    worst_weeks = bench_weekly.nsmallest(n_worst)
+
+    rows = []
+    for date, bench_ret in worst_weeks.items():
+        row = {"Week ending": date.strftime("%Y-%m-%d")}
+        for col in weekly_rets.columns:
+            val = weekly_rets.loc[date, col] if date in weekly_rets.index else None
+            row[short_name(col)] = val
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def stress_test_html(stress_df, benchmark_short):
+    """Render the stress test table as styled HTML."""
+    if stress_df is None or stress_df.empty:
+        return ""
+
+    fund_cols = [c for c in stress_df.columns if c != "Week ending"]
+    header = "<th>Week ending</th>" + "".join(f"<th>{c}</th>" for c in fund_cols)
+
+    body = ""
+    for _, row in stress_df.iterrows():
+        cells = f"<td style='font-weight:600'>{row['Week ending']}</td>"
+        for c in fund_cols:
+            val = row[c]
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                cells += "<td>—</td>"
+            else:
+                pct = val * 100
+                cls = "pos" if pct >= 0 else "neg"
+                cells += f"<td class='{cls}'>{pct:+.2f}%</td>"
+        body += f"<tr>{cells}</tr>\n"
+
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+
+# ---------------------------------------------------------------------------
+# Portfolio optimization
+# ---------------------------------------------------------------------------
+
+def optimize_portfolios(prices, benchmark_name, aqr_names):
+    """
+    Build three portfolios from FTSE All World + AQR funds:
+      1. Equal Weight: 50% FTSE, rest equally among AQR funds
+      2. Minimum Variance: minimize portfolio variance
+      3. Maximum Diversification: maximize diversification ratio
+    Constraint: FTSE weight >= 50%, all weights >= 0, sum = 1.
+    """
+    # Use only the overlapping period with all funds present
+    cols = [benchmark_name] + aqr_names
+    overlap = prices[cols].dropna()
+    daily_rets = overlap.pct_change().dropna()
+
+    n = len(cols)
+    cov = daily_rets.cov().values * 252  # annualized covariance
+    vols = np.sqrt(np.diag(cov))         # annualized vols
+
+    # Find benchmark index position
+    bench_idx = 0  # benchmark is first column
+
+    # Constraints and bounds
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
+    ]
+    bounds = [(0.5 if i == bench_idx else 0.0, 1.0) for i in range(n)]
+
+    # --- Equal Weight ---
+    n_aqr = len(aqr_names)
+    ew = np.zeros(n)
+    ew[bench_idx] = 0.5
+    ew[1:] = 0.5 / n_aqr
+
+    # --- Minimum Variance ---
+    def port_var(w):
+        return w @ cov @ w
+
+    x0 = ew.copy()
+    res_mv = minimize(port_var, x0, method="SLSQP",
+                      bounds=bounds, constraints=constraints)
+    w_mv = res_mv.x if res_mv.success else ew.copy()
+
+    # --- Maximum Diversification ---
+    def neg_div_ratio(w):
+        port_vol = np.sqrt(w @ cov @ w)
+        weighted_vol = w @ vols
+        if port_vol < 1e-10:
+            return 0.0
+        return -weighted_vol / port_vol
+
+    res_md = minimize(neg_div_ratio, x0, method="SLSQP",
+                      bounds=bounds, constraints=constraints)
+    w_md = res_md.x if res_md.success else ew.copy()
+
+    # Build results
+    portfolios = {
+        "Equal Weight": ew,
+        "Min Variance": w_mv,
+        "Max Diversification": w_md,
+    }
+
+    # Compute equity curves over the overlap period
+    equity_curves = pd.DataFrame(index=overlap.index)
+    for name, w in portfolios.items():
+        port_rets = daily_rets.values @ w
+        equity_curves[name] = (1 + pd.Series(port_rets, index=daily_rets.index)).cumprod()
+
+    # Also add pure FTSE for reference
+    ftse_rets = daily_rets[benchmark_name]
+    equity_curves["FTSE All World (100%)"] = (1 + ftse_rets).cumprod()
+
+    # Compute statistics
+    stats_rows = {}
+    for name, w in portfolios.items():
+        port_daily = pd.Series(daily_rets.values @ w, index=daily_rets.index)
+        ann_ret = port_daily.mean() * 252
+        ann_vol = port_daily.std() * np.sqrt(252)
+        sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
+        cum = (1 + port_daily).cumprod()
+        drawdown = cum / cum.cummax() - 1
+        max_dd = drawdown.min()
+        stats_rows[name] = {
+            "Ann. Return": ann_ret,
+            "Ann. Vol": ann_vol,
+            "Sharpe": sharpe,
+            "Max Drawdown": max_dd,
+        }
+
+    # Add pure FTSE stats
+    ann_ret_f = ftse_rets.mean() * 252
+    ann_vol_f = ftse_rets.std() * np.sqrt(252)
+    cum_f = (1 + ftse_rets).cumprod()
+    dd_f = cum_f / cum_f.cummax() - 1
+    stats_rows["FTSE All World (100%)"] = {
+        "Ann. Return": ann_ret_f,
+        "Ann. Vol": ann_vol_f,
+        "Sharpe": ann_ret_f / ann_vol_f if ann_vol_f > 0 else 0,
+        "Max Drawdown": dd_f.min(),
+    }
+
+    stats = pd.DataFrame(stats_rows).T
+
+    # Weights dict with short names
+    weights = {}
+    for name, w in portfolios.items():
+        weights[name] = {short_name(cols[i]): w[i] for i in range(n)}
+
+    return weights, equity_curves, stats
+
+
+def portfolio_chart(equity_curves):
+    """Performance chart for optimized portfolios."""
+    port_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#999999"]
+    fig = go.Figure()
+    for i, col in enumerate(equity_curves.columns):
+        dash = "dash" if col == "FTSE All World (100%)" else None
+        fig.add_trace(go.Scatter(
+            x=equity_curves.index, y=equity_curves[col],
+            mode="lines", name=col,
+            line=dict(color=port_colors[i % len(port_colors)], width=2.5, dash=dash),
+        ))
+    fig.update_layout(
+        title="Portfolio Performance (Indexed to 1.0)",
+        yaxis_title="Growth of 1.0",
+        template="plotly_white", height=520,
+        legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center"),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def portfolio_stats_html(stats, weights):
+    """Render portfolio statistics and weights as HTML tables."""
+    # Stats table
+    stat_cols = ["Ann. Return", "Ann. Vol", "Sharpe", "Max Drawdown"]
+    header = "<th>Portfolio</th>" + "".join(f"<th>{c}</th>" for c in stat_cols)
+    body = ""
+    for portfolio in stats.index:
+        cells = f"<td class='fund-name'>{portfolio}</td>"
+        for c in stat_cols:
+            val = stats.loc[portfolio, c]
+            if c == "Sharpe":
+                cells += f"<td>{val:.2f}</td>"
+            elif c == "Max Drawdown":
+                pct = val * 100
+                cells += f"<td class='neg'>{pct:.1f}%</td>"
+            else:
+                pct = val * 100
+                cls = "pos" if pct >= 0 else "neg"
+                cells += f"<td class='{cls}'>{pct:+.1f}%</td>"
+        body += f"<tr>{cells}</tr>\n"
+    stats_html = f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+    # Weights table (only for the 3 optimized portfolios, not FTSE 100%)
+    fund_names = list(next(iter(weights.values())).keys())
+    w_header = "<th>Portfolio</th>" + "".join(f"<th>{f}</th>" for f in fund_names)
+    w_body = ""
+    for portfolio, w in weights.items():
+        cells = f"<td class='fund-name'>{portfolio}</td>"
+        for f in fund_names:
+            pct = w[f] * 100
+            if pct < 0.5:
+                cells += "<td style='color:#ccc'>0%</td>"
+            else:
+                cells += f"<td>{pct:.1f}%</td>"
+        w_body += f"<tr>{cells}</tr>\n"
+    weights_html = f"<table><thead><tr>{w_header}</tr></thead><tbody>{w_body}</tbody></table>"
+
+    return stats_html, weights_html
+
+
 def correlation_heatmap(prices):
     """Correlation matrix heatmap of daily returns."""
     rets = prices.pct_change().dropna(how="all")
@@ -348,12 +570,20 @@ def generate_report(prices, returns_table, tickers):
     fig2 = rolling_correlation_chart(prices, aqr_names, benchmark_name) if benchmark_name else None
     fig3 = correlation_heatmap(prices)
     fig4 = return_dendrogram(prices)
+    stress_df = stress_test_table(prices, benchmark_name) if benchmark_name else None
+    port_weights, port_curves, port_stats = optimize_portfolios(
+        prices, benchmark_name, aqr_names,
+    ) if benchmark_name else (None, None, None)
+    fig5 = portfolio_chart(port_curves) if port_curves is not None else None
 
     tbl = returns_table_html(returns_table)
+    stress_tbl = stress_test_html(stress_df, short_name(benchmark_name)) if stress_df is not None else ""
+    port_stats_tbl, port_weights_tbl = portfolio_stats_html(port_stats, port_weights) if port_stats is not None else ("", "")
     c1 = fig1.to_html(full_html=False, include_plotlyjs=False)
     c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
     c3 = fig3.to_html(full_html=False, include_plotlyjs=False)
     c4 = fig4.to_html(full_html=False, include_plotlyjs=False)
+    c5 = fig5.to_html(full_html=False, include_plotlyjs=False) if fig5 else ""
 
     rolling_corr_section = ""
     if c2:
@@ -416,6 +646,20 @@ def generate_report(prices, returns_table, tickers):
 <div class="chart-box">{c4}</div>
 
 {rolling_corr_section}
+
+<h2>Stress Test — Worst Weeks (FTSE All World)</h2>
+<p class="note">Fund returns during the 5 worst weekly drawdowns of {short_name(benchmark_name) if benchmark_name else 'benchmark'}. Positive returns indicate diversification benefit.</p>
+{stress_tbl}
+
+<h2>Portfolio Optimization</h2>
+<p class="note">Optimized portfolios using FTSE All World + AQR funds. Constraint: at least 50% in FTSE All World. Based on the common overlap period of all funds.</p>
+<div class="chart-box">{c5}</div>
+
+<h3>Portfolio Statistics</h3>
+{port_stats_tbl}
+
+<h3>Weight Allocation</h3>
+{port_weights_tbl}
 
 </body>
 </html>"""
