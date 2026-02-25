@@ -121,13 +121,20 @@ def compute_returns_table(prices):
         if years > 0:
             row["Max (p.a.)"] = (1 + row["Max"]) ** (1 / years) - 1
 
-        # Annualized volatility and Sharpe ratio
+        # Annualized volatility (full history) and Sharpe ratio (1Y)
         daily_rets = s.pct_change().dropna()
         if len(daily_rets) > 20:
             ann_vol = daily_rets.std() * np.sqrt(252)
             row["Vol (ann.)"] = ann_vol
-            if ann_vol > 0 and years > 0:
-                row["Sharpe"] = row["Max (p.a.)"] / ann_vol
+
+            # Sharpe over last 1 year
+            one_year_ago = latest - pd.DateOffset(years=1)
+            rets_1y = daily_rets[daily_rets.index >= one_year_ago]
+            if len(rets_1y) > 20:
+                ann_ret_1y = rets_1y.mean() * 252
+                ann_vol_1y = rets_1y.std() * np.sqrt(252)
+                if ann_vol_1y > 0:
+                    row["Sharpe (1Y)"] = ann_ret_1y / ann_vol_1y
 
         rows[col] = row
 
@@ -257,11 +264,11 @@ def correlation_heatmap(prices):
 
 def returns_table_html(returns_table):
     """Render performance table as styled HTML."""
-    display_cols = ["Start", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe"]
+    display_cols = ["Start", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe (1Y)"]
     col_labels = {
         "Start": "Start Date", "1M": "1 Month", "3M": "3 Months",
         "1Y": "1 Year", "Max": "Max (total)", "Max (p.a.)": "Max (p.a.)",
-        "Vol (ann.)": "Vol (ann.)", "Sharpe": "Sharpe",
+        "Vol (ann.)": "Vol (ann.)", "Sharpe (1Y)": "Sharpe (1Y)",
     }
     cols = [c for c in display_cols if c in returns_table.columns]
 
@@ -277,7 +284,7 @@ def returns_table_html(returns_table):
                 cells += "<td>—</td>"
             elif c == "Start":
                 cells += f"<td>{val}</td>"
-            elif c == "Sharpe":
+            elif c == "Sharpe (1Y)":
                 cells += f"<td>{val:.2f}</td>"
             elif c == "Vol (ann.)":
                 cells += f"<td>{val * 100:.1f}%</td>"
