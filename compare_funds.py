@@ -152,28 +152,69 @@ COLORS = [
 
 
 def performance_chart(prices):
-    """All funds indexed to 1.0 from common start date."""
+    """All funds indexed to 1.0 with timeframe selector buttons."""
+    latest = prices.index.max()
     starts = prices.apply(lambda s: s.dropna().index.min())
     common_start = starts.max()
-    trimmed = prices[prices.index >= common_start].copy()
+
+    # Define timeframes
+    timeframes = {
+        "1M": latest - pd.DateOffset(months=1),
+        "3M": latest - pd.DateOffset(months=3),
+        "1Y": latest - pd.DateOffset(years=1),
+        "All": common_start,
+    }
 
     fig = go.Figure()
-    for i, col in enumerate(trimmed.columns):
-        s = trimmed[col].dropna()
-        if s.empty:
-            continue
-        indexed = s / s.iloc[0]
-        fig.add_trace(go.Scatter(
-            x=indexed.index, y=indexed.values,
-            mode="lines", name=short_name(col),
-            line=dict(color=COLORS[i % len(COLORS)], width=2),
+
+    # Add one set of traces per timeframe, only "All" visible initially
+    buttons = []
+    n_funds = len(prices.columns)
+    for tf_idx, (tf_label, tf_start) in enumerate(timeframes.items()):
+        start = max(tf_start, common_start)
+        trimmed = prices[prices.index >= start].copy()
+        for i, col in enumerate(trimmed.columns):
+            s = trimmed[col].dropna()
+            if s.empty:
+                continue
+            indexed = s / s.iloc[0]
+            fig.add_trace(go.Scatter(
+                x=indexed.index, y=indexed.values,
+                mode="lines", name=short_name(col),
+                line=dict(color=COLORS[i % len(COLORS)], width=2),
+                visible=(tf_label == "All"),
+                showlegend=(tf_label == "All"),
+            ))
+
+        # Build visibility mask for this button
+        vis = [False] * (n_funds * len(timeframes))
+        for j in range(n_funds):
+            vis[tf_idx * n_funds + j] = True
+        # Also set showlegend for the visible traces
+        buttons.append(dict(
+            label=tf_label,
+            method="update",
+            args=[
+                {"visible": vis},
+                {"title": f"Indexed Performance ({tf_label})"},
+            ],
         ))
+
     fig.update_layout(
-        title=f"Indexed Performance (common start: {common_start.date()})",
+        title="Indexed Performance (All)",
         yaxis_title="Growth of 1.0",
         template="plotly_white", height=520,
         legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center"),
         hovermode="x unified",
+        updatemenus=[dict(
+            type="buttons",
+            direction="right",
+            x=0.0, xanchor="left",
+            y=1.12, yanchor="top",
+            buttons=buttons,
+            bgcolor="#e8e8e8",
+            font=dict(size=12),
+        )],
     )
     return fig
 
