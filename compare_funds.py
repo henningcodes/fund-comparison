@@ -223,8 +223,8 @@ def performance_chart(prices):
         updatemenus=[dict(
             type="buttons",
             direction="right",
-            x=0.0, xanchor="left",
-            y=1.08, yanchor="top",
+            x=1.0, xanchor="right",
+            y=1.18, yanchor="top",
             buttons=buttons,
             bgcolor="#e8e8e8",
             font=dict(size=12),
