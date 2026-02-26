@@ -137,6 +137,19 @@ def compute_returns_table(prices):
                 if ann_vol_1y > 0:
                     row["Sharpe (1Y)"] = ann_ret_1y / ann_vol_1y
 
+            # Ulcer Performance Index (1Y)
+            prices_1y = s[s.index >= one_year_ago]
+            if len(prices_1y) > 20:
+                running_max = prices_1y.cummax()
+                drawdown_pct = ((prices_1y - running_max) / running_max) * 100
+                ulcer_index = np.sqrt((drawdown_pct ** 2).mean())
+                if ulcer_index > 0:
+                    ann_ret_1y_ul = (prices_1y.iloc[-1] / prices_1y.iloc[0] - 1)
+                    years_1y = (prices_1y.index[-1] - prices_1y.index[0]).days / 365.25
+                    if years_1y > 0:
+                        ann_ret_1y_ul = (1 + ann_ret_1y_ul) ** (1 / years_1y) - 1
+                    row["UPI (1Y)"] = (ann_ret_1y_ul * 100) / ulcer_index
+
         rows[col] = row
 
     return pd.DataFrame(rows).T
@@ -205,13 +218,13 @@ def performance_chart(prices):
         title="Indexed Performance (All)",
         yaxis_title="Growth of 1.0",
         template="plotly_white", height=520,
-        legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center"),
+        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
         hovermode="x unified",
         updatemenus=[dict(
             type="buttons",
             direction="right",
             x=0.0, xanchor="left",
-            y=1.12, yanchor="top",
+            y=1.08, yanchor="top",
             buttons=buttons,
             bgcolor="#e8e8e8",
             font=dict(size=12),
@@ -291,6 +304,7 @@ def stress_test_table(prices, benchmark_name, n_worst=5):
         return None
 
     bench_weekly = weekly_rets[benchmark_name].dropna()
+    bench_weekly = bench_weekly[bench_weekly.index >= "2024-01-01"]
     worst_weeks = bench_weekly.nsmallest(n_worst)
 
     rows = []
@@ -412,11 +426,15 @@ def optimize_portfolios(prices, benchmark_name, aqr_names):
         cum = (1 + port_daily).cumprod()
         drawdown = cum / cum.cummax() - 1
         max_dd = drawdown.min()
+        dd_pct = (drawdown * 100)
+        ulcer = np.sqrt((dd_pct ** 2).mean())
+        upi = (ann_ret * 100) / ulcer if ulcer > 0 else 0
         stats_rows[name] = {
             "Ann. Return": ann_ret,
             "Ann. Vol": ann_vol,
             "Sharpe": sharpe,
             "Max Drawdown": max_dd,
+            "UPI": upi,
         }
 
     # Add pure FTSE stats
@@ -424,11 +442,15 @@ def optimize_portfolios(prices, benchmark_name, aqr_names):
     ann_vol_f = ftse_rets.std() * np.sqrt(252)
     cum_f = (1 + ftse_rets).cumprod()
     dd_f = cum_f / cum_f.cummax() - 1
+    dd_f_pct = (dd_f * 100)
+    ulcer_f = np.sqrt((dd_f_pct ** 2).mean())
+    upi_f = (ann_ret_f * 100) / ulcer_f if ulcer_f > 0 else 0
     stats_rows["FTSE All World (100%)"] = {
         "Ann. Return": ann_ret_f,
         "Ann. Vol": ann_vol_f,
         "Sharpe": ann_ret_f / ann_vol_f if ann_vol_f > 0 else 0,
         "Max Drawdown": dd_f.min(),
+        "UPI": upi_f,
     }
 
     stats = pd.DataFrame(stats_rows).T
@@ -465,14 +487,14 @@ def portfolio_chart(equity_curves):
 def portfolio_stats_html(stats, weights):
     """Render portfolio statistics and weights as HTML tables."""
     # Stats table
-    stat_cols = ["Ann. Return", "Ann. Vol", "Sharpe", "Max Drawdown"]
+    stat_cols = ["Ann. Return", "Ann. Vol", "Sharpe", "Max Drawdown", "UPI"]
     header = "<th>Portfolio</th>" + "".join(f"<th>{c}</th>" for c in stat_cols)
     body = ""
     for portfolio in stats.index:
         cells = f"<td class='fund-name'>{portfolio}</td>"
         for c in stat_cols:
             val = stats.loc[portfolio, c]
-            if c == "Sharpe":
+            if c in ("Sharpe", "UPI"):
                 cells += f"<td>{val:.2f}</td>"
             elif c == "Max Drawdown":
                 pct = val * 100
@@ -527,11 +549,12 @@ def correlation_heatmap(prices):
 
 def returns_table_html(returns_table):
     """Render performance table as styled HTML."""
-    display_cols = ["Start", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe (1Y)"]
+    display_cols = ["Start", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe (1Y)", "UPI (1Y)"]
     col_labels = {
         "Start": "Start Date", "1M": "1 Month", "3M": "3 Months",
         "1Y": "1 Year", "Max": "Max (total)", "Max (p.a.)": "Max (p.a.)",
         "Vol (ann.)": "Vol (ann.)", "Sharpe (1Y)": "Sharpe (1Y)",
+        "UPI (1Y)": "UPI (1Y)",
     }
     cols = [c for c in display_cols if c in returns_table.columns]
 
@@ -547,7 +570,7 @@ def returns_table_html(returns_table):
                 cells += "<td>—</td>"
             elif c == "Start":
                 cells += f"<td>{val}</td>"
-            elif c == "Sharpe (1Y)":
+            elif c in ("Sharpe (1Y)", "UPI (1Y)"):
                 cells += f"<td>{val:.2f}</td>"
             elif c == "Vol (ann.)":
                 cells += f"<td>{val * 100:.1f}%</td>"
@@ -557,7 +580,7 @@ def returns_table_html(returns_table):
                 cells += f"<td class='{cls}'>{pct:+.2f}%</td>"
         body += f"<tr>{cells}</tr>\n"
 
-    return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+    return f"<table class='sortable'><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
 def generate_report(prices, returns_table, tickers):
@@ -617,6 +640,15 @@ def generate_report(prices, returns_table, tickers):
     background: #1a1a2e; color: #fff; padding: 12px 16px;
     text-align: center; font-size: 13px;
   }}
+  .sortable th {{
+    cursor: pointer; user-select: none; position: relative;
+  }}
+  .sortable th:hover {{ background: #2a2a4e; }}
+  .sortable th::after {{
+    content: '\u2195'; opacity: 0.4; margin-left: 4px; font-size: 11px;
+  }}
+  .sortable th.sort-asc::after {{ content: '\u25B2'; opacity: 1; }}
+  .sortable th.sort-desc::after {{ content: '\u25BC'; opacity: 1; }}
   td {{ padding: 10px 16px; text-align: center; border-bottom: 1px solid #eee; font-size: 13px; }}
   .fund-name {{ font-weight: 600; text-align: left !important; white-space: nowrap; }}
   .pos {{ color: #2ca02c; font-weight: 600; }}
@@ -661,6 +693,31 @@ def generate_report(prices, returns_table, tickers):
 <h3>Weight Allocation</h3>
 {port_weights_tbl}
 
+<script>
+document.querySelectorAll('table.sortable').forEach(table => {{
+  const headers = table.querySelectorAll('th');
+  headers.forEach((th, colIdx) => {{
+    th.addEventListener('click', () => {{
+      const tbody = table.querySelector('tbody');
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const curDir = th.classList.contains('sort-asc') ? 'desc' : 'asc';
+      headers.forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+      th.classList.add('sort-' + curDir);
+      rows.sort((a, b) => {{
+        let aText = a.children[colIdx].textContent.trim();
+        let bText = b.children[colIdx].textContent.trim();
+        let aVal = parseFloat(aText.replace(/[%+,]/g, ''));
+        let bVal = parseFloat(bText.replace(/[%+,]/g, ''));
+        if (isNaN(aVal) || isNaN(bVal)) {{
+          return curDir === 'asc' ? aText.localeCompare(bText) : bText.localeCompare(aText);
+        }}
+        return curDir === 'asc' ? aVal - bVal : bVal - aVal;
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+    }});
+  }});
+}});
+</script>
 </body>
 </html>"""
 
