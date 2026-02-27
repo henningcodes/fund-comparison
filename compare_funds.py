@@ -1,12 +1,22 @@
 """
 AQR Fund Comparison Tool
 
-Downloads daily prices via yfinance (using ISINs) for funds in tickerlist.csv,
-generates an HTML report with:
+Downloads daily prices via yfinance (using ISINs) for funds in tickerlist.csv
+and ETFs in etfs.csv, generates an HTML report with two tabs:
+
+Tab 1 – AQR Funds:
 - Performance table (1M, 3M, 1Y, Max returns)
-- Indexed performance chart (base = 1.0)
+- Indexed performance chart
 - Correlation matrix (daily returns)
-- Relative performance of AQR funds vs FTSE All World
+- Hierarchical clustering dendrogram
+- Rolling correlation with FTSE All World
+- Stress test (worst weeks)
+- Portfolio optimization (≥50% FTSE constraint)
+
+Tab 2 – Global Equity ETFs:
+- Same sections as Tab 1
+- Correlation relative to FTSE All World
+- Portfolio optimization with no minimum-weight constraint
 """
 
 import datetime as dt
@@ -28,7 +38,7 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 
 def read_tickers(csv_path):
-    """Parse tickerlist.csv -> list of (isin, name, bbg_ticker)."""
+    """Parse a ticker CSV -> list of (isin, name, bbg_ticker)."""
     tickers = []
     with open(csv_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -39,7 +49,6 @@ def read_tickers(csv_path):
             if len(parts) >= 3:
                 tickers.append((parts[0], parts[1], parts[2]))
             elif len(parts) == 2:
-                # Handle "Name, TICKER Equity" format
                 sub = parts[1].rsplit(",", 1)
                 if len(sub) == 2:
                     tickers.append((parts[0], sub[0].strip(), sub[1].strip()))
@@ -48,13 +57,22 @@ def read_tickers(csv_path):
 
 # Short display names for charts
 SHORT_NAMES = {
+    # AQR funds
     "APEX": "AQR Apex",
     "ADAPTIVE EQUITY MARKET NEUTRAL": "AQR Eq Mkt Neutral",
     "ALTERNATIVE TRENDS": "AQR Alt Trends",
     "STYLE PREMIA": "AQR Style Premia",
     "MANAGED FUTURES": "AQR Managed Futures",
     "Delphi Long-Short": "AQR Delphi L/S",
+    # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
+    # Global equity ETFs
+    "iShares MSCI World": "MSCI World",
+    "Xtrackers MSCI USA": "MSCI USA",
+    "iShares MSCI Europe": "MSCI Europe",
+    "iShares MSCI Emerging Markets": "EM",
+    "ishares MSCI Japan": "MSCI Japan",
+    "iShares Pacific": "Pacific ex-JP",
 }
 
 
@@ -79,7 +97,7 @@ def download_prices(tickers):
             hist = tk.history(period="max")
             if not hist.empty and "Close" in hist.columns:
                 series = hist["Close"].dropna()
-                series.index = series.index.tz_localize(None)  # remove timezone
+                series.index = series.index.tz_localize(None)
                 all_prices[name] = series
                 print(f"  {len(series):5d} days  ({series.index.min().date()} -> {series.index.max().date()})")
             else:
@@ -116,19 +134,16 @@ def compute_returns_table(prices):
             else:
                 row[label] = None
 
-        # Max total and annualized
         row["Max"] = s.iloc[-1] / s.iloc[0] - 1
         years = (s.index[-1] - s.index[0]).days / 365.25
         if years > 0:
             row["Max (p.a.)"] = (1 + row["Max"]) ** (1 / years) - 1
 
-        # Annualized volatility (full history) and Sharpe ratio (1Y)
         daily_rets = s.pct_change().dropna()
         if len(daily_rets) > 20:
             ann_vol = daily_rets.std() * np.sqrt(252)
             row["Vol (ann.)"] = ann_vol
 
-            # Sharpe over last 1 year
             one_year_ago = latest - pd.DateOffset(years=1)
             rets_1y = daily_rets[daily_rets.index >= one_year_ago]
             if len(rets_1y) > 20:
@@ -137,7 +152,6 @@ def compute_returns_table(prices):
                 if ann_vol_1y > 0:
                     row["Sharpe (1Y)"] = ann_ret_1y / ann_vol_1y
 
-            # Ulcer Performance Index (1Y)
             prices_1y = s[s.index >= one_year_ago]
             if len(prices_1y) > 20:
                 running_max = prices_1y.cummax()
@@ -165,13 +179,12 @@ COLORS = [
 ]
 
 
-def performance_chart(prices):
+def performance_chart(prices, chart_id_prefix="perf"):
     """All funds indexed to 1.0 with timeframe selector buttons."""
     latest = prices.index.max()
     starts = prices.apply(lambda s: s.dropna().index.min())
     common_start = starts.max()
 
-    # Define timeframes
     timeframes = {
         "1M": latest - pd.DateOffset(months=1),
         "3M": latest - pd.DateOffset(months=3),
@@ -180,8 +193,6 @@ def performance_chart(prices):
     }
 
     fig = go.Figure()
-
-    # Add one set of traces per timeframe, only "All" visible initially
     buttons = []
     n_funds = len(prices.columns)
     for tf_idx, (tf_label, tf_start) in enumerate(timeframes.items()):
@@ -200,11 +211,9 @@ def performance_chart(prices):
                 showlegend=(tf_label == "All"),
             ))
 
-        # Build visibility mask for this button
         vis = [False] * (n_funds * len(timeframes))
         for j in range(n_funds):
             vis[tf_idx * n_funds + j] = True
-        # Also set showlegend for the visible traces
         buttons.append(dict(
             label=tf_label,
             method="update",
@@ -233,11 +242,11 @@ def performance_chart(prices):
     return fig
 
 
-def rolling_correlation_chart(prices, aqr_names, benchmark_name, window=60):
-    """60-day rolling correlation of AQR funds vs benchmark."""
+def rolling_correlation_chart(prices, fund_names, benchmark_name, window=60):
+    """60-day rolling correlation of funds vs benchmark."""
     bench_rets = prices[benchmark_name].pct_change()
     fig = go.Figure()
-    for i, name in enumerate(aqr_names):
+    for i, name in enumerate(fund_names):
         fund_rets = prices[name].pct_change()
         combined = pd.concat(
             [fund_rets.rename("fund"), bench_rets.rename("bench")],
@@ -246,7 +255,6 @@ def rolling_correlation_chart(prices, aqr_names, benchmark_name, window=60):
         if len(combined) < window:
             continue
         rolling_corr = combined["fund"].rolling(window).corr(combined["bench"]).dropna()
-        # Only show last year
         one_year_ago = rolling_corr.index.max() - pd.DateOffset(months=6)
         rolling_corr = rolling_corr[rolling_corr.index >= one_year_ago]
         if rolling_corr.empty:
@@ -272,7 +280,6 @@ def return_dendrogram(prices):
     """Hierarchical clustering dendrogram based on correlation distance."""
     rets = prices.pct_change().dropna(how="all")
     corr = rets.corr()
-    # Correlation distance: d = sqrt(0.5 * (1 - corr))
     dist = np.sqrt(0.5 * (1 - corr)).values.copy()
     np.fill_diagonal(dist, 0)
     condensed = squareform(dist)
@@ -296,7 +303,6 @@ def return_dendrogram(prices):
 
 def stress_test_table(prices, benchmark_name, n_worst=5):
     """Find the worst n weeks for the benchmark and show all funds' returns."""
-    # Compute weekly returns (Friday-to-Friday)
     weekly = prices.resample("W-FRI").last()
     weekly_rets = weekly.pct_change().dropna(how="all")
 
@@ -342,81 +348,160 @@ def stress_test_html(stress_df, benchmark_short):
     return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
+def correlation_heatmap(prices):
+    """Correlation matrix heatmap of daily returns."""
+    rets = prices.pct_change().dropna(how="all")
+    corr = rets.corr()
+    labels = [short_name(c) for c in corr.columns]
+
+    fig = go.Figure(go.Heatmap(
+        z=corr.values, x=labels, y=labels,
+        colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
+        text=[[f"{v:.2f}" for v in row] for row in corr.values],
+        texttemplate="%{text}", textfont=dict(size=12),
+    ))
+    fig.update_layout(
+        title="Correlation Matrix (Daily Returns)",
+        template="plotly_white", height=550, width=750,
+    )
+    return fig
+
+
+def correlation_vs_benchmark_chart(prices, fund_names, benchmark_name):
+    """Bar chart of full-period correlation of each fund vs the benchmark."""
+    rets = prices.pct_change().dropna(how="all")
+    bench_rets = rets[benchmark_name]
+    corrs = []
+    labels = []
+    for name in fund_names:
+        if name not in rets.columns:
+            continue
+        combined = pd.concat(
+            [rets[name].rename("fund"), bench_rets.rename("bench")],
+            axis=1,
+        ).dropna()
+        if len(combined) < 20:
+            continue
+        c = combined["fund"].corr(combined["bench"])
+        corrs.append(c)
+        labels.append(short_name(name))
+
+    colors = ["#2ca02c" if c >= 0 else "#d62728" for c in corrs]
+    fig = go.Figure(go.Bar(
+        x=labels, y=corrs,
+        marker_color=colors,
+        text=[f"{c:.2f}" for c in corrs],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title=f"Correlation with {short_name(benchmark_name)} (Full Period, Daily Returns)",
+        yaxis_title="Correlation",
+        yaxis=dict(range=[-0.1, 1.1]),
+        template="plotly_white", height=420,
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Portfolio optimization
 # ---------------------------------------------------------------------------
 
 def optimize_portfolios(prices, benchmark_name, aqr_names):
     """
-    Build three portfolios from FTSE All World + AQR funds:
-      1. Equal Weight: 50% FTSE, rest equally among AQR funds
-      2. Minimum Variance: minimize portfolio variance
-      3. Maximum Diversification: maximize diversification ratio
+    AQR tab: FTSE All World + AQR funds.
     Constraint: FTSE weight >= 50%, all weights >= 0, sum = 1.
     """
-    # Use only the overlapping period with all funds present
     cols = [benchmark_name] + aqr_names
     overlap = prices[cols].dropna()
     daily_rets = overlap.pct_change().dropna()
 
     n = len(cols)
-    cov = daily_rets.cov().values * 252  # annualized covariance
-    vols = np.sqrt(np.diag(cov))         # annualized vols
+    cov = daily_rets.cov().values * 252
+    vols = np.sqrt(np.diag(cov))
 
-    # Find benchmark index position
-    bench_idx = 0  # benchmark is first column
-
-    # Constraints and bounds
-    constraints = [
-        {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
-    ]
+    bench_idx = 0
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
     bounds = [(0.5 if i == bench_idx else 0.0, 1.0) for i in range(n)]
 
-    # --- Equal Weight ---
     n_aqr = len(aqr_names)
     ew = np.zeros(n)
     ew[bench_idx] = 0.5
     ew[1:] = 0.5 / n_aqr
 
-    # --- Minimum Variance ---
     def port_var(w):
         return w @ cov @ w
 
-    x0 = ew.copy()
-    res_mv = minimize(port_var, x0, method="SLSQP",
+    res_mv = minimize(port_var, ew.copy(), method="SLSQP",
                       bounds=bounds, constraints=constraints)
     w_mv = res_mv.x if res_mv.success else ew.copy()
 
-    # --- Maximum Diversification ---
     def neg_div_ratio(w):
         port_vol = np.sqrt(w @ cov @ w)
         weighted_vol = w @ vols
-        if port_vol < 1e-10:
-            return 0.0
-        return -weighted_vol / port_vol
+        return 0.0 if port_vol < 1e-10 else -weighted_vol / port_vol
 
-    res_md = minimize(neg_div_ratio, x0, method="SLSQP",
+    res_md = minimize(neg_div_ratio, ew.copy(), method="SLSQP",
                       bounds=bounds, constraints=constraints)
     w_md = res_md.x if res_md.success else ew.copy()
 
-    # Build results
-    portfolios = {
+    return _build_portfolio_results(cols, daily_rets, cov, vols, {
         "Equal Weight": ew,
         "Min Variance": w_mv,
         "Max Diversification": w_md,
-    }
+    }, benchmark_name)
 
-    # Compute equity curves over the overlap period
-    equity_curves = pd.DataFrame(index=overlap.index)
+
+def optimize_portfolios_free(prices, benchmark_name, fund_names):
+    """
+    ETF tab: no minimum weight constraint — optimizer picks freely.
+    Constraints: all weights >= 0, sum = 1.
+    """
+    cols = [benchmark_name] + fund_names
+    overlap = prices[cols].dropna()
+    daily_rets = overlap.pct_change().dropna()
+
+    n = len(cols)
+    cov = daily_rets.cov().values * 252
+    vols = np.sqrt(np.diag(cov))
+
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    bounds = [(0.0, 1.0) for _ in range(n)]
+
+    ew = np.ones(n) / n  # equal weight across all ETFs (incl. benchmark)
+
+    def port_var(w):
+        return w @ cov @ w
+
+    res_mv = minimize(port_var, ew.copy(), method="SLSQP",
+                      bounds=bounds, constraints=constraints)
+    w_mv = res_mv.x if res_mv.success else ew.copy()
+
+    def neg_div_ratio(w):
+        port_vol = np.sqrt(w @ cov @ w)
+        weighted_vol = w @ vols
+        return 0.0 if port_vol < 1e-10 else -weighted_vol / port_vol
+
+    res_md = minimize(neg_div_ratio, ew.copy(), method="SLSQP",
+                      bounds=bounds, constraints=constraints)
+    w_md = res_md.x if res_md.success else ew.copy()
+
+    return _build_portfolio_results(cols, daily_rets, cov, vols, {
+        "Equal Weight": ew,
+        "Min Variance": w_mv,
+        "Max Diversification": w_md,
+    }, benchmark_name)
+
+
+def _build_portfolio_results(cols, daily_rets, cov, vols, portfolios, benchmark_name):
+    """Shared logic: build equity curves and stats for a set of portfolios."""
+    equity_curves = pd.DataFrame(index=daily_rets.index)
     for name, w in portfolios.items():
         port_rets = daily_rets.values @ w
         equity_curves[name] = (1 + pd.Series(port_rets, index=daily_rets.index)).cumprod()
 
-    # Also add pure FTSE for reference
-    ftse_rets = daily_rets[benchmark_name]
-    equity_curves["FTSE All World (100%)"] = (1 + ftse_rets).cumprod()
+    bench_rets = daily_rets[benchmark_name]
+    equity_curves["FTSE All World (100%)"] = (1 + bench_rets).cumprod()
 
-    # Compute statistics
     stats_rows = {}
     for name, w in portfolios.items():
         port_daily = pd.Series(daily_rets.values @ w, index=daily_rets.index)
@@ -426,7 +511,7 @@ def optimize_portfolios(prices, benchmark_name, aqr_names):
         cum = (1 + port_daily).cumprod()
         drawdown = cum / cum.cummax() - 1
         max_dd = drawdown.min()
-        dd_pct = (drawdown * 100)
+        dd_pct = drawdown * 100
         ulcer = np.sqrt((dd_pct ** 2).mean())
         upi = (ann_ret * 100) / ulcer if ulcer > 0 else 0
         stats_rows[name] = {
@@ -437,12 +522,11 @@ def optimize_portfolios(prices, benchmark_name, aqr_names):
             "UPI": upi,
         }
 
-    # Add pure FTSE stats
-    ann_ret_f = ftse_rets.mean() * 252
-    ann_vol_f = ftse_rets.std() * np.sqrt(252)
-    cum_f = (1 + ftse_rets).cumprod()
+    ann_ret_f = bench_rets.mean() * 252
+    ann_vol_f = bench_rets.std() * np.sqrt(252)
+    cum_f = (1 + bench_rets).cumprod()
     dd_f = cum_f / cum_f.cummax() - 1
-    dd_f_pct = (dd_f * 100)
+    dd_f_pct = dd_f * 100
     ulcer_f = np.sqrt((dd_f_pct ** 2).mean())
     upi_f = (ann_ret_f * 100) / ulcer_f if ulcer_f > 0 else 0
     stats_rows["FTSE All World (100%)"] = {
@@ -454,12 +538,10 @@ def optimize_portfolios(prices, benchmark_name, aqr_names):
     }
 
     stats = pd.DataFrame(stats_rows).T
-
-    # Weights dict with short names
-    weights = {}
-    for name, w in portfolios.items():
-        weights[name] = {short_name(cols[i]): w[i] for i in range(n)}
-
+    weights = {
+        name: {short_name(cols[i]): w[i] for i in range(len(cols))}
+        for name, w in portfolios.items()
+    }
     return weights, equity_curves, stats
 
 
@@ -486,7 +568,6 @@ def portfolio_chart(equity_curves):
 
 def portfolio_stats_html(stats, weights):
     """Render portfolio statistics and weights as HTML tables."""
-    # Stats table
     stat_cols = ["Ann. Return", "Ann. Vol", "Sharpe", "Max Drawdown", "UPI"]
     header = "<th>Portfolio</th>" + "".join(f"<th>{c}</th>" for c in stat_cols)
     body = ""
@@ -506,7 +587,6 @@ def portfolio_stats_html(stats, weights):
         body += f"<tr>{cells}</tr>\n"
     stats_html = f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
-    # Weights table (only for the 3 optimized portfolios, not FTSE 100%)
     fund_names = list(next(iter(weights.values())).keys())
     w_header = "<th>Portfolio</th>" + "".join(f"<th>{f}</th>" for f in fund_names)
     w_body = ""
@@ -524,27 +604,8 @@ def portfolio_stats_html(stats, weights):
     return stats_html, weights_html
 
 
-def correlation_heatmap(prices):
-    """Correlation matrix heatmap of daily returns."""
-    rets = prices.pct_change().dropna(how="all")
-    corr = rets.corr()
-    labels = [short_name(c) for c in corr.columns]
-
-    fig = go.Figure(go.Heatmap(
-        z=corr.values, x=labels, y=labels,
-        colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
-        text=[[f"{v:.2f}" for v in row] for row in corr.values],
-        texttemplate="%{text}", textfont=dict(size=12),
-    ))
-    fig.update_layout(
-        title="Correlation Matrix (Daily Returns)",
-        template="plotly_white", height=550, width=750,
-    )
-    return fig
-
-
 # ---------------------------------------------------------------------------
-# HTML report
+# HTML table helpers
 # ---------------------------------------------------------------------------
 
 def returns_table_html(returns_table):
@@ -583,7 +644,12 @@ def returns_table_html(returns_table):
     return f"<table class='sortable'><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def generate_report(prices, returns_table, tickers):
+# ---------------------------------------------------------------------------
+# Tab section builders
+# ---------------------------------------------------------------------------
+
+def build_aqr_section(prices, returns_table, tickers):
+    """Build the HTML content for the AQR Funds tab."""
     aqr_names = [name for isin, name, _ in tickers if isin.startswith("LU")]
     benchmark_name = next(
         (name for isin, name, _ in tickers if isin.startswith("IE")), None
@@ -608,20 +674,137 @@ def generate_report(prices, returns_table, tickers):
     c4 = fig4.to_html(full_html=False, include_plotlyjs=False)
     c5 = fig5.to_html(full_html=False, include_plotlyjs=False) if fig5 else ""
 
-    rolling_corr_section = ""
+    rolling_corr_section = (
+        "<h2>Rolling Correlation with FTSE All World</h2>\n"
+        "<p class='note'>60-day rolling correlation of daily returns. "
+        "Values near 0 indicate low correlation (diversification benefit).</p>\n"
+        f"<div class='chart-box'>{c2}</div>"
+    ) if c2 else ""
+
+    bench_label = short_name(benchmark_name) if benchmark_name else "benchmark"
+
+    return f"""
+<h2>Performance Summary</h2>
+{tbl}
+
+<h2>Indexed Performance</h2>
+<div class="chart-box">{c1}</div>
+
+<h2>Correlation Matrix</h2>
+<div class="chart-box">{c3}</div>
+
+<h2>Fund Clustering</h2>
+<p class="note">Hierarchical clustering using correlation distance. Funds that merge at lower heights have more similar return profiles.</p>
+<div class="chart-box">{c4}</div>
+
+{rolling_corr_section}
+
+<h2>Stress Test — Worst Weeks (FTSE All World)</h2>
+<p class="note">Fund returns during the 5 worst weekly drawdowns of {bench_label}. Positive returns indicate diversification benefit.</p>
+{stress_tbl}
+
+<h2>Portfolio Optimization</h2>
+<p class="note">Optimized portfolios using FTSE All World + AQR funds. Constraint: at least 50% in FTSE All World. Based on the common overlap period of all funds.</p>
+<div class="chart-box">{c5}</div>
+
+<h3>Portfolio Statistics</h3>
+{port_stats_tbl}
+
+<h3>Weight Allocation</h3>
+{port_weights_tbl}
+"""
+
+
+def build_etf_section(prices, returns_table, etf_tickers):
+    """Build the HTML content for the Global Equity ETFs tab."""
+    benchmark_isin = "IE00BK5BQT80"
+    benchmark_name = next(
+        (name for isin, name, _ in etf_tickers if isin == benchmark_isin), None
+    )
+    etf_names = [name for isin, name, _ in etf_tickers if isin != benchmark_isin]
+
+    fig1 = performance_chart(prices)
+    fig_corr_bar = correlation_vs_benchmark_chart(prices, etf_names, benchmark_name) if benchmark_name else None
+    fig2 = rolling_correlation_chart(prices, etf_names, benchmark_name) if benchmark_name else None
+    fig3 = correlation_heatmap(prices)
+    fig4 = return_dendrogram(prices)
+    stress_df = stress_test_table(prices, benchmark_name) if benchmark_name else None
+    port_weights, port_curves, port_stats = optimize_portfolios_free(
+        prices, benchmark_name, etf_names,
+    ) if benchmark_name else (None, None, None)
+    fig5 = portfolio_chart(port_curves) if port_curves is not None else None
+
+    tbl = returns_table_html(returns_table)
+    stress_tbl = stress_test_html(stress_df, short_name(benchmark_name)) if stress_df is not None else ""
+    port_stats_tbl, port_weights_tbl = portfolio_stats_html(port_stats, port_weights) if port_stats is not None else ("", "")
+    c1 = fig1.to_html(full_html=False, include_plotlyjs=False)
+    c_bar = fig_corr_bar.to_html(full_html=False, include_plotlyjs=False) if fig_corr_bar else ""
+    c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
+    c3 = fig3.to_html(full_html=False, include_plotlyjs=False)
+    c4 = fig4.to_html(full_html=False, include_plotlyjs=False)
+    c5 = fig5.to_html(full_html=False, include_plotlyjs=False) if fig5 else ""
+
+    bench_label = short_name(benchmark_name) if benchmark_name else "benchmark"
+
+    corr_section = ""
+    if c_bar:
+        corr_section += (
+            "<h2>Correlation with FTSE All World</h2>\n"
+            "<p class='note'>Full-period Pearson correlation of each ETF's daily returns against the FTSE All World.</p>\n"
+            f"<div class='chart-box'>{c_bar}</div>"
+        )
     if c2:
-        rolling_corr_section = (
+        corr_section += (
             "<h2>Rolling Correlation with FTSE All World</h2>\n"
-            "<p class='note'>60-day rolling correlation of daily returns. "
-            "Values near 0 indicate low correlation (diversification benefit).</p>\n"
+            "<p class='note'>60-day rolling correlation of daily returns against FTSE All World.</p>\n"
             f"<div class='chart-box'>{c2}</div>"
         )
+
+    return f"""
+<h2>Performance Summary</h2>
+{tbl}
+
+<h2>Indexed Performance</h2>
+<div class="chart-box">{c1}</div>
+
+<h2>Correlation Matrix</h2>
+<div class="chart-box">{c3}</div>
+
+<h2>Fund Clustering</h2>
+<p class="note">Hierarchical clustering using correlation distance. ETFs that merge at lower heights have more similar return profiles.</p>
+<div class="chart-box">{c4}</div>
+
+{corr_section}
+
+<h2>Stress Test — Worst Weeks (FTSE All World)</h2>
+<p class="note">ETF returns during the 5 worst weekly drawdowns of {bench_label}.</p>
+{stress_tbl}
+
+<h2>Portfolio Optimization</h2>
+<p class="note">Optimized portfolios from the global equity ETF universe. No minimum weight constraint — the optimizer picks freely. Based on the common overlap period of all ETFs.</p>
+<div class="chart-box">{c5}</div>
+
+<h3>Portfolio Statistics</h3>
+{port_stats_tbl}
+
+<h3>Weight Allocation</h3>
+{port_weights_tbl}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Full HTML report (two tabs)
+# ---------------------------------------------------------------------------
+
+def generate_report(aqr_section, etf_section):
+    """Wrap two tab sections into a complete HTML page."""
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>AQR Fund Comparison</title>
+<title>Fund Comparison</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
   body {{
@@ -658,42 +841,56 @@ def generate_report(prices, returns_table, tickers):
     background: #fff; border-radius: 8px; padding: 15px; margin: 20px 0;
     box-shadow: 0 1px 3px rgba(0,0,0,.12);
   }}
+
+  /* ── Tab navigation ── */
+  .tab-nav {{
+    display: flex; gap: 4px; margin: 24px 0 0; border-bottom: 2px solid #1a1a2e;
+  }}
+  .tab-btn {{
+    padding: 10px 28px; font-size: 14px; font-weight: 600; border: none;
+    border-radius: 6px 6px 0 0; cursor: pointer; background: #dde1ea; color: #555;
+    transition: background 0.15s, color 0.15s;
+  }}
+  .tab-btn:hover {{ background: #c5cad8; color: #1a1a2e; }}
+  .tab-btn.active {{ background: #1a1a2e; color: #fff; }}
+  .tab-content {{ display: none; }}
+  .tab-content.active {{ display: block; }}
 </style>
 </head>
 <body>
-<h1>AQR Fund Comparison</h1>
-<p class="subtitle">Generated {dt.datetime.now().strftime("%Y-%m-%d %H:%M")} | Data source: Yahoo Finance</p>
+<h1>Fund Comparison</h1>
+<p class="subtitle">Generated {generated} | Data source: Yahoo Finance</p>
 
-<h2>Performance Summary</h2>
-{tbl}
+<div class="tab-nav">
+  <button class="tab-btn active" data-tab="aqr">AQR Funds</button>
+  <button class="tab-btn" data-tab="etf">Global Equity ETFs</button>
+</div>
 
-<h2>Indexed Performance</h2>
-<div class="chart-box">{c1}</div>
+<div class="tab-content active" id="tab-aqr">
+{aqr_section}
+</div>
 
-<h2>Correlation Matrix</h2>
-<div class="chart-box">{c3}</div>
-
-<h2>Fund Clustering</h2>
-<p class="note">Hierarchical clustering using correlation distance. Funds that merge at lower heights have more similar return profiles.</p>
-<div class="chart-box">{c4}</div>
-
-{rolling_corr_section}
-
-<h2>Stress Test — Worst Weeks (FTSE All World)</h2>
-<p class="note">Fund returns during the 5 worst weekly drawdowns of {short_name(benchmark_name) if benchmark_name else 'benchmark'}. Positive returns indicate diversification benefit.</p>
-{stress_tbl}
-
-<h2>Portfolio Optimization</h2>
-<p class="note">Optimized portfolios using FTSE All World + AQR funds. Constraint: at least 50% in FTSE All World. Based on the common overlap period of all funds.</p>
-<div class="chart-box">{c5}</div>
-
-<h3>Portfolio Statistics</h3>
-{port_stats_tbl}
-
-<h3>Weight Allocation</h3>
-{port_weights_tbl}
+<div class="tab-content" id="tab-etf">
+{etf_section}
+</div>
 
 <script>
+// ── Tab switching ──────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {{
+  btn.addEventListener('click', () => {{
+    const tab = btn.dataset.tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + tab).classList.add('active');
+    // Resize Plotly charts that were hidden during initial render
+    document.querySelectorAll('#tab-' + tab + ' .js-plotly-plot').forEach(el => {{
+      Plotly.Plots.resize(el);
+    }});
+  }});
+}});
+
+// ── Sortable tables ────────────────────────────────────────────────────────
 document.querySelectorAll('table.sortable').forEach(table => {{
   const headers = table.querySelectorAll('th');
   headers.forEach((th, colIdx) => {{
@@ -728,7 +925,6 @@ document.querySelectorAll('table.sortable').forEach(table => {{
 
 def main():
     project_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(project_dir, "tickerlist.csv")
     output_dir = os.path.join(project_dir, "public")
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "index.html")
@@ -737,29 +933,44 @@ def main():
     print("  AQR Fund Comparison")
     print("=" * 60)
 
-    tickers = read_tickers(csv_path)
-    print(f"\n  {len(tickers)} funds:\n")
+    # ── AQR funds ──────────────────────────────────────────────
+    aqr_csv = os.path.join(project_dir, "tickerlist.csv")
+    aqr_tickers = read_tickers(aqr_csv)
+    print(f"\n  AQR funds ({len(aqr_tickers)}):\n")
+    aqr_prices = download_prices(aqr_tickers)
 
-    # Download via yfinance using ISINs
-    prices = download_prices(tickers)
-
-    if prices.empty:
-        print("\nERROR: No data downloaded")
+    if aqr_prices.empty:
+        print("\nERROR: No AQR data downloaded")
         sys.exit(1)
 
-    # Forward-fill gaps (different trading calendars)
-    prices = prices.ffill()
-    print(f"\n  Combined: {prices.shape[1]} funds, {prices.shape[0]} trading days")
+    aqr_prices = aqr_prices.ffill()
+    print(f"\n  AQR combined: {aqr_prices.shape[1]} funds, {aqr_prices.shape[0]} trading days")
+    aqr_returns = compute_returns_table(aqr_prices)
 
-    # Performance table
-    returns_table = compute_returns_table(prices)
-    print(f"\n{returns_table.to_string()}\n")
+    # ── Global equity ETFs ──────────────────────────────────────
+    etf_csv = os.path.join(project_dir, "etfs.csv")
+    etf_tickers = read_tickers(etf_csv)
+    print(f"\n  Global equity ETFs ({len(etf_tickers)}):\n")
+    etf_prices = download_prices(etf_tickers)
 
-    # Generate HTML report
-    html = generate_report(prices, returns_table, tickers)
+    if etf_prices.empty:
+        print("\nERROR: No ETF data downloaded")
+        sys.exit(1)
+
+    etf_prices = etf_prices.ffill()
+    print(f"\n  ETF combined: {etf_prices.shape[1]} ETFs, {etf_prices.shape[0]} trading days")
+    etf_returns = compute_returns_table(etf_prices)
+
+    # ── Build report ────────────────────────────────────────────
+    print("\n  Building AQR section...")
+    aqr_section = build_aqr_section(aqr_prices, aqr_returns, aqr_tickers)
+    print("  Building ETF section...")
+    etf_section = build_etf_section(etf_prices, etf_returns, etf_tickers)
+
+    html = generate_report(aqr_section, etf_section)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"  Report: {output_path}")
+    print(f"\n  Report: {output_path}")
     print("  Done!")
 
 
