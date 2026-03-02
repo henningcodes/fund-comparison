@@ -64,6 +64,9 @@ SHORT_NAMES = {
     "STYLE PREMIA": "AQR Style Premia",
     "MANAGED FUTURES": "AQR Managed Futures",
     "Delphi Long-Short": "AQR Delphi L/S",
+    # Other AQR-tab non-AQR funds
+    "UBS Carry": "UBS Carry",
+    "Invesco Physical Gold": "Gold",
     # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
     # Global equity ETFs
@@ -675,10 +678,11 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     prices_raw: pre-ffill DataFrame, used for all analytics so that overlaps are
                 based on real trading dates only.
     """
-    aqr_names = [name for isin, name, _ in tickers if isin.startswith("LU")]
+    benchmark_isin = "IE00BK5BQT80"
     benchmark_name = next(
-        (name for isin, name, _ in tickers if isin.startswith("IE")), None
+        (name for isin, name, _ in tickers if isin == benchmark_isin), None
     )
+    aqr_names = [name for isin, name, _ in tickers if isin != benchmark_isin]
 
     fig1 = performance_chart(prices)
     fig2 = rolling_correlation_chart(prices_raw, aqr_names, benchmark_name) if benchmark_name else None
