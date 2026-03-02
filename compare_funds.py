@@ -115,15 +115,9 @@ def compute_returns_table(prices, last_valid=None):
     """Compute 1M, 3M, 1Y, Max total and annualized returns.
 
     last_valid: dict {col -> (last_date, last_price)} captured before ffill,
-                so the displayed date/price reflects actual published data.
+                so each fund's returns are calculated up to its own last real
+                data point (not the ffill-padded end of the DataFrame).
     """
-    latest = prices.index.max()
-    cutoffs = {
-        "1M": latest - pd.DateOffset(months=1),
-        "3M": latest - pd.DateOffset(months=3),
-        "1Y": latest - pd.DateOffset(years=1),
-    }
-
     rows = {}
     for col in prices.columns:
         s = prices[col].dropna()
@@ -131,8 +125,19 @@ def compute_returns_table(prices, last_valid=None):
             continue
         if last_valid and col in last_valid:
             last_date, last_price = last_valid[col]
+            s = s[s.index <= last_date]  # strip ffill-padded tail
         else:
             last_date, last_price = s.index[-1], s.iloc[-1]
+        if s.empty:
+            continue
+
+        # Cutoffs anchored to this fund's own last data date
+        cutoffs = {
+            "1M": last_date - pd.DateOffset(months=1),
+            "3M": last_date - pd.DateOffset(months=3),
+            "1Y": last_date - pd.DateOffset(years=1),
+        }
+
         row = {
             "Start": s.index[0].strftime("%Y-%m-%d"),
             "Last Date": last_date.strftime("%Y-%m-%d"),
@@ -156,7 +161,7 @@ def compute_returns_table(prices, last_valid=None):
             ann_vol = daily_rets.std() * np.sqrt(252)
             row["Vol (ann.)"] = ann_vol
 
-            one_year_ago = latest - pd.DateOffset(years=1)
+            one_year_ago = last_date - pd.DateOffset(years=1)
             rets_1y = daily_rets[daily_rets.index >= one_year_ago]
             if len(rets_1y) > 20:
                 ann_ret_1y = rets_1y.mean() * 252
@@ -663,20 +668,25 @@ def returns_table_html(returns_table):
 # Tab section builders
 # ---------------------------------------------------------------------------
 
-def build_aqr_section(prices, returns_table, tickers):
-    """Build the HTML content for the AQR Funds tab."""
+def build_aqr_section(prices, prices_raw, returns_table, tickers):
+    """Build the HTML content for the AQR Funds tab.
+
+    prices:     ffill-padded DataFrame, used only for the indexed performance chart.
+    prices_raw: pre-ffill DataFrame, used for all analytics so that overlaps are
+                based on real trading dates only.
+    """
     aqr_names = [name for isin, name, _ in tickers if isin.startswith("LU")]
     benchmark_name = next(
         (name for isin, name, _ in tickers if isin.startswith("IE")), None
     )
 
     fig1 = performance_chart(prices)
-    fig2 = rolling_correlation_chart(prices, aqr_names, benchmark_name) if benchmark_name else None
-    fig3 = correlation_heatmap(prices)
-    fig4 = return_dendrogram(prices)
-    stress_df = stress_test_table(prices, benchmark_name) if benchmark_name else None
+    fig2 = rolling_correlation_chart(prices_raw, aqr_names, benchmark_name) if benchmark_name else None
+    fig3 = correlation_heatmap(prices_raw)
+    fig4 = return_dendrogram(prices_raw)
+    stress_df = stress_test_table(prices_raw, benchmark_name) if benchmark_name else None
     port_weights, port_curves, port_stats = optimize_portfolios(
-        prices, benchmark_name, aqr_names,
+        prices_raw, benchmark_name, aqr_names,
     ) if benchmark_name else (None, None, None)
     fig5 = portfolio_chart(port_curves) if port_curves is not None else None
 
@@ -730,8 +740,13 @@ def build_aqr_section(prices, returns_table, tickers):
 """
 
 
-def build_etf_section(prices, returns_table, etf_tickers):
-    """Build the HTML content for the Global Equity ETFs tab."""
+def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
+    """Build the HTML content for the Global Equity ETFs tab.
+
+    prices:     ffill-padded DataFrame, used only for the indexed performance chart.
+    prices_raw: pre-ffill DataFrame, used for all analytics so that overlaps are
+                based on real trading dates only.
+    """
     benchmark_isin = "IE00BK5BQT80"
     benchmark_name = next(
         (name for isin, name, _ in etf_tickers if isin == benchmark_isin), None
@@ -739,13 +754,13 @@ def build_etf_section(prices, returns_table, etf_tickers):
     etf_names = [name for isin, name, _ in etf_tickers if isin != benchmark_isin]
 
     fig1 = performance_chart(prices)
-    fig_corr_bar = correlation_vs_benchmark_chart(prices, etf_names, benchmark_name) if benchmark_name else None
-    fig2 = rolling_correlation_chart(prices, etf_names, benchmark_name) if benchmark_name else None
-    fig3 = correlation_heatmap(prices)
-    fig4 = return_dendrogram(prices)
-    stress_df = stress_test_table(prices, benchmark_name) if benchmark_name else None
+    fig_corr_bar = correlation_vs_benchmark_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
+    fig2 = rolling_correlation_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
+    fig3 = correlation_heatmap(prices_raw)
+    fig4 = return_dendrogram(prices_raw)
+    stress_df = stress_test_table(prices_raw, benchmark_name) if benchmark_name else None
     port_weights, port_curves, port_stats = optimize_portfolios_free(
-        prices, benchmark_name, etf_names,
+        prices_raw, benchmark_name, etf_names,
     ) if benchmark_name else (None, None, None)
     fig5 = portfolio_chart(port_curves) if port_curves is not None else None
 
@@ -963,6 +978,7 @@ def main():
         for col in aqr_prices.columns
         if aqr_prices[col].last_valid_index() is not None
     }
+    aqr_prices_raw = aqr_prices.copy()   # keep pre-ffill for analytics
     aqr_prices = aqr_prices.ffill()
     print(f"\n  AQR combined: {aqr_prices.shape[1]} funds, {aqr_prices.shape[0]} trading days")
     aqr_returns = compute_returns_table(aqr_prices, aqr_last_valid)
@@ -982,15 +998,16 @@ def main():
         for col in etf_prices.columns
         if etf_prices[col].last_valid_index() is not None
     }
+    etf_prices_raw = etf_prices.copy()   # keep pre-ffill for analytics
     etf_prices = etf_prices.ffill()
     print(f"\n  ETF combined: {etf_prices.shape[1]} ETFs, {etf_prices.shape[0]} trading days")
     etf_returns = compute_returns_table(etf_prices, etf_last_valid)
 
     # ── Build report ────────────────────────────────────────────
     print("\n  Building AQR section...")
-    aqr_section = build_aqr_section(aqr_prices, aqr_returns, aqr_tickers)
+    aqr_section = build_aqr_section(aqr_prices, aqr_prices_raw, aqr_returns, aqr_tickers)
     print("  Building ETF section...")
-    etf_section = build_etf_section(etf_prices, etf_returns, etf_tickers)
+    etf_section = build_etf_section(etf_prices, etf_prices_raw, etf_returns, etf_tickers)
 
     html = generate_report(aqr_section, etf_section)
     with open(output_path, "w", encoding="utf-8") as f:
