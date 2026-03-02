@@ -125,7 +125,11 @@ def compute_returns_table(prices):
         s = prices[col].dropna()
         if s.empty:
             continue
-        row = {"Start": s.index[0].strftime("%Y-%m-%d")}
+        row = {
+            "Start": s.index[0].strftime("%Y-%m-%d"),
+            "Last Date": s.index[-1].strftime("%Y-%m-%d"),
+            "Last Price": s.iloc[-1],
+        }
 
         for label, cutoff in cutoffs.items():
             sub = s[s.index >= cutoff]
@@ -610,9 +614,10 @@ def portfolio_stats_html(stats, weights):
 
 def returns_table_html(returns_table):
     """Render performance table as styled HTML."""
-    display_cols = ["Start", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe (1Y)", "UPI (1Y)"]
+    display_cols = ["Start", "Last Date", "Last Price", "1M", "3M", "1Y", "Max", "Max (p.a.)", "Vol (ann.)", "Sharpe (1Y)", "UPI (1Y)"]
     col_labels = {
-        "Start": "Start Date", "1M": "1 Month", "3M": "3 Months",
+        "Start": "Start Date", "Last Date": "Last Price Date", "Last Price": "Last Price",
+        "1M": "1 Month", "3M": "3 Months",
         "1Y": "1 Year", "Max": "Max (total)", "Max (p.a.)": "Max (p.a.)",
         "Vol (ann.)": "Vol (ann.)", "Sharpe (1Y)": "Sharpe (1Y)",
         "UPI (1Y)": "UPI (1Y)",
@@ -629,8 +634,10 @@ def returns_table_html(returns_table):
             val = row.get(c)
             if val is None or (isinstance(val, float) and np.isnan(val)):
                 cells += "<td>—</td>"
-            elif c == "Start":
+            elif c in ("Start", "Last Date"):
                 cells += f"<td>{val}</td>"
+            elif c == "Last Price":
+                cells += f"<td>{val:,.2f}</td>"
             elif c in ("Sharpe (1Y)", "UPI (1Y)"):
                 cells += f"<td>{val:.2f}</td>"
             elif c == "Vol (ann.)":
