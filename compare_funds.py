@@ -111,8 +111,12 @@ def download_prices(tickers):
 # Analytics
 # ---------------------------------------------------------------------------
 
-def compute_returns_table(prices):
-    """Compute 1M, 3M, 1Y, Max total and annualized returns."""
+def compute_returns_table(prices, last_valid=None):
+    """Compute 1M, 3M, 1Y, Max total and annualized returns.
+
+    last_valid: dict {col -> (last_date, last_price)} captured before ffill,
+                so the displayed date/price reflects actual published data.
+    """
     latest = prices.index.max()
     cutoffs = {
         "1M": latest - pd.DateOffset(months=1),
@@ -125,10 +129,14 @@ def compute_returns_table(prices):
         s = prices[col].dropna()
         if s.empty:
             continue
+        if last_valid and col in last_valid:
+            last_date, last_price = last_valid[col]
+        else:
+            last_date, last_price = s.index[-1], s.iloc[-1]
         row = {
             "Start": s.index[0].strftime("%Y-%m-%d"),
-            "Last Date": s.index[-1].strftime("%Y-%m-%d"),
-            "Last Price": s.iloc[-1],
+            "Last Date": last_date.strftime("%Y-%m-%d"),
+            "Last Price": last_price,
         }
 
         for label, cutoff in cutoffs.items():
@@ -950,9 +958,14 @@ def main():
         print("\nERROR: No AQR data downloaded")
         sys.exit(1)
 
+    aqr_last_valid = {
+        col: (aqr_prices[col].last_valid_index(), aqr_prices[col].dropna().iloc[-1])
+        for col in aqr_prices.columns
+        if aqr_prices[col].last_valid_index() is not None
+    }
     aqr_prices = aqr_prices.ffill()
     print(f"\n  AQR combined: {aqr_prices.shape[1]} funds, {aqr_prices.shape[0]} trading days")
-    aqr_returns = compute_returns_table(aqr_prices)
+    aqr_returns = compute_returns_table(aqr_prices, aqr_last_valid)
 
     # ── Global equity ETFs ──────────────────────────────────────
     etf_csv = os.path.join(project_dir, "etfs.csv")
@@ -964,9 +977,14 @@ def main():
         print("\nERROR: No ETF data downloaded")
         sys.exit(1)
 
+    etf_last_valid = {
+        col: (etf_prices[col].last_valid_index(), etf_prices[col].dropna().iloc[-1])
+        for col in etf_prices.columns
+        if etf_prices[col].last_valid_index() is not None
+    }
     etf_prices = etf_prices.ffill()
     print(f"\n  ETF combined: {etf_prices.shape[1]} ETFs, {etf_prices.shape[0]} trading days")
-    etf_returns = compute_returns_table(etf_prices)
+    etf_returns = compute_returns_table(etf_prices, etf_last_valid)
 
     # ── Build report ────────────────────────────────────────────
     print("\n  Building AQR section...")
