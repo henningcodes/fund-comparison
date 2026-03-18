@@ -67,6 +67,7 @@ SHORT_NAMES = {
     # Other AQR-tab non-AQR funds
     "UBS Carry": "UBS Carry",
     "Invesco Physical Gold": "Gold",
+    "Global Aggregate Bond UCITS EUR Hedged": "Global Agg Bond",
     # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
     # Global equity ETFs
