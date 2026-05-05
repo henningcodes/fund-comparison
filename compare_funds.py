@@ -2,7 +2,7 @@
 AQR Fund Comparison Tool
 
 Downloads daily prices via yfinance (using ISINs) for funds in tickerlist.csv
-and ETFs in etfs.csv, generates an HTML report with two tabs:
+and ETFs in etfs.csv, generates an HTML report with three tabs:
 
 Tab 1 – AQR Funds:
 - Performance table (1M, 3M, 1Y, Max returns)
@@ -17,6 +17,11 @@ Tab 2 – Global Equity ETFs:
 - Same sections as Tab 1
 - Correlation relative to FTSE All World
 - Portfolio optimization with no minimum-weight constraint
+
+Tab 3 – Sector Performance:
+- US Sectors (SPDR Select Sector ETFs vs S&P 500 / Nasdaq 100)
+- STOXX Europe 600 Sectors (Lyxor/Amundi/iShares vs broad STOXX 600)
+- Sourced from CSV outputs of the equity-sector-performance scripts.
 """
 
 import datetime as dt
@@ -760,6 +765,218 @@ def returns_table_html(returns_table):
 
 
 # ---------------------------------------------------------------------------
+# Sector performance (sourced from equity-sector-performance CSVs)
+# ---------------------------------------------------------------------------
+
+SECTOR_DATA_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "equity-sector-performance", "scripts", "output",
+))
+
+
+def _sector_color_for(name, broad_labels, palette_idx):
+    """Black for the broad index, palette colors for sectors."""
+    if name in broad_labels:
+        return "#1a1a2e"
+    return COLORS[palette_idx % len(COLORS)]
+
+
+def sector_performance_chart(prices, broad_labels, title):
+    """Indexed performance chart with timeframe buttons; broad index highlighted."""
+    if prices is None or prices.empty:
+        return None
+
+    latest = prices.index.max()
+    earliest = prices.index.min()
+    timeframes = {
+        "1M": latest - pd.DateOffset(months=1),
+        "3M": latest - pd.DateOffset(months=3),
+        "6M": latest - pd.DateOffset(months=6),
+        "1Y": latest - pd.DateOffset(years=1),
+        "All": earliest,
+    }
+
+    fig = go.Figure()
+    trace_groups = []
+    palette_idx = 0
+    name_to_pidx = {}
+    for name in prices.columns:
+        if name in broad_labels:
+            name_to_pidx[name] = -1
+        else:
+            name_to_pidx[name] = palette_idx
+            palette_idx += 1
+
+    for tf_label, tf_start in timeframes.items():
+        start = max(tf_start, earliest)
+        trimmed = prices[prices.index >= start]
+        trace_indices = []
+        for name in trimmed.columns:
+            s = trimmed[name].dropna()
+            if s.empty:
+                continue
+            indexed = s / s.iloc[0]
+            is_broad = name in broad_labels
+            color = _sector_color_for(name, broad_labels, name_to_pidx[name])
+            fig.add_trace(go.Scatter(
+                x=indexed.index, y=indexed.values,
+                mode="lines", name=name,
+                line=dict(color=color, width=3 if is_broad else 1.6),
+                opacity=1.0 if is_broad else 0.85,
+                visible=(tf_label == "1Y"),
+                showlegend=(tf_label == "1Y"),
+            ))
+            trace_indices.append(len(fig.data) - 1)
+        trace_groups.append(trace_indices)
+
+    if not fig.data:
+        return None
+
+    total = len(fig.data)
+    buttons = []
+    for tf_label, indices in zip(timeframes.keys(), trace_groups):
+        vis = [False] * total
+        for idx in indices:
+            vis[idx] = True
+        buttons.append(dict(
+            label=tf_label,
+            method="update",
+            args=[{"visible": vis}, {"title": f"{title} ({tf_label})"}],
+        ))
+
+    fig.update_layout(
+        title=f"{title} (1Y)",
+        yaxis_title="Growth of 1.0",
+        template="plotly_white",
+        height=540,
+        legend=dict(orientation="v", y=1.0, x=1.02, xanchor="left", yanchor="top"),
+        hovermode="x unified",
+        margin=dict(r=200),
+        updatemenus=[dict(
+            type="buttons", direction="right",
+            x=0.0, xanchor="left", y=1.12, yanchor="top",
+            buttons=buttons,
+            bgcolor="#e8e8e8", font=dict(size=12),
+        )],
+    )
+    return fig
+
+
+def sector_metrics_table_html(metrics_df):
+    """Render the sector metrics CSV in the AQR table style."""
+    if metrics_df is None or metrics_df.empty:
+        return ""
+    cols = [c for c in ["1W", "1M", "3M", "1Y", "Ann Vol (1Y)", "Sharpe (rf=0)"] if c in metrics_df.columns]
+    header = "<th>Sector</th>" + "".join(f"<th>{c}</th>" for c in cols)
+    body = ""
+    for _, row in metrics_df.iterrows():
+        cells = f"<td class='fund-name'>{row['Series']}</td>"
+        for c in cols:
+            val = row.get(c)
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                cells += "<td>-</td>"
+            elif c == "Sharpe (rf=0)":
+                cells += f"<td>{val:.2f}</td>"
+            elif c == "Ann Vol (1Y)":
+                cells += f"<td>{val * 100:.1f}%</td>"
+            else:
+                pct = val * 100
+                cls = "pos" if pct >= 0 else "neg"
+                cells += f"<td class='{cls}'>{pct:+.2f}%</td>"
+        body += f"<tr>{cells}</tr>\n"
+    return f"<table class='sortable'><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def sector_mapping_table_html(mapping_df):
+    """Render the WKN/ISIN/Ticker mapping in the AQR table style."""
+    if mapping_df is None or mapping_df.empty:
+        return ""
+    cols = [c for c in mapping_df.columns if c != "Series"]
+    header = "<th>Sector</th>" + "".join(f"<th>{c}</th>" for c in cols)
+    body = ""
+    for _, row in mapping_df.iterrows():
+        cells = f"<td class='fund-name'>{row['Series']}</td>"
+        for c in cols:
+            val = row[c]
+            if pd.isna(val):
+                val = ""
+            cells += f"<td style='text-align:left'>{val}</td>"
+        body += f"<tr>{cells}</tr>\n"
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def build_sector_group(group_id, group_title, intro, prices_csv, metrics_csv, mapping_csv,
+                       broad_labels, chart_title):
+    """Render one sector group (US or STOXX 600) as HTML."""
+    prices_path = os.path.join(SECTOR_DATA_DIR, prices_csv)
+    metrics_path = os.path.join(SECTOR_DATA_DIR, metrics_csv)
+    mapping_path = os.path.join(SECTOR_DATA_DIR, mapping_csv)
+
+    if not (os.path.exists(prices_path) and os.path.exists(metrics_path) and os.path.exists(mapping_path)):
+        return empty_state_html(
+            f"{group_title} data unavailable",
+            f"Run the sector report script in equity-sector-performance/scripts to generate "
+            f"{prices_csv}, {metrics_csv}, {mapping_csv}.",
+        )
+
+    prices = pd.read_csv(prices_path, parse_dates=["date"]).set_index("date").sort_index()
+    metrics = pd.read_csv(metrics_path)
+    mapping = pd.read_csv(mapping_path)
+
+    fig = sector_performance_chart(prices, broad_labels=broad_labels, title=chart_title)
+    chart_html = fig.to_html(full_html=False, include_plotlyjs=False) if fig else ""
+
+    metrics_html = sector_metrics_table_html(metrics)
+    mapping_html = sector_mapping_table_html(mapping)
+    last_date = prices.index.max().strftime("%Y-%m-%d") if not prices.empty else "—"
+
+    parts = [f"<h2 id='{group_id}'>{group_title}</h2>"]
+    if intro:
+        parts.append(f"<p class='note'>{intro} Last data point: {last_date}.</p>")
+    if metrics_html:
+        parts.append("<h3>Performance &amp; Risk</h3>")
+        parts.append(metrics_html)
+    if chart_html:
+        parts.append("<h3>Indexed Performance</h3>")
+        parts.append(f"<div class='chart-box'>{chart_html}</div>")
+    if mapping_html:
+        parts.append("<h3>Instrument Mapping</h3>")
+        parts.append(mapping_html)
+    return "\n".join(parts)
+
+
+def build_sector_section():
+    """Build the full Sector Performance tab content."""
+    us = build_sector_group(
+        group_id="sector-us",
+        group_title="US Sectors",
+        intro=(
+            "SPDR Select Sector ETFs vs the S&amp;P 500 and Nasdaq 100. "
+            "Daily total-return prices from EODHD."
+        ),
+        prices_csv="us_sector_prices.csv",
+        metrics_csv="us_sector_metrics.csv",
+        mapping_csv="us_sector_mapping.csv",
+        broad_labels={"S&P 500", "Nasdaq 100"},
+        chart_title="US Sector Indexed Performance",
+    )
+    eu = build_sector_group(
+        group_id="sector-eu",
+        group_title="STOXX Europe 600 Sectors",
+        intro=(
+            "Lyxor / Amundi / iShares STOXX Europe 600 sector ETFs vs the broad STOXX 600. "
+            "Daily total-return prices from EODHD."
+        ),
+        prices_csv="stoxx600_sector_prices.csv",
+        metrics_csv="stoxx600_sector_metrics.csv",
+        mapping_csv="stoxx600_sector_mapping.csv",
+        broad_labels={"Stoxx 600"},
+        chart_title="STOXX 600 Sector Indexed Performance",
+    )
+    return us + "\n" + eu
+
+
+# ---------------------------------------------------------------------------
 # Tab section builders
 # ---------------------------------------------------------------------------
 def build_aqr_section(prices, prices_raw, returns_table, tickers):
@@ -967,8 +1184,8 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     return "\n".join(sections)
 
 
-def generate_report(aqr_section, etf_section):
-    """Wrap two tab sections into a complete HTML page."""
+def generate_report(aqr_section, etf_section, sector_section):
+    """Wrap three tab sections into a complete HTML page."""
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return f"""<!DOCTYPE html>
@@ -984,6 +1201,7 @@ def generate_report(aqr_section, etf_section):
   }}
   h1 {{ color: #1a1a2e; border-bottom: 3px solid #1a1a2e; padding-bottom: 10px; }}
   h2 {{ color: #16213e; margin-top: 40px; }}
+  h3 {{ color: #2a3a5a; margin-top: 24px; font-size: 16px; }}
   .subtitle {{ color: #666; font-size: 14px; }}
   .note {{ color: #888; font-size: 13px; margin-top: -5px; }}
   table {{
@@ -1039,6 +1257,7 @@ def generate_report(aqr_section, etf_section):
 <div class="tab-nav">
   <button class="tab-btn active" data-tab="aqr">AQR Funds</button>
   <button class="tab-btn" data-tab="etf">Global Equity ETFs</button>
+  <button class="tab-btn" data-tab="sector">Sector Performance</button>
 </div>
 
 <div class="tab-content active" id="tab-aqr">
@@ -1047,6 +1266,10 @@ def generate_report(aqr_section, etf_section):
 
 <div class="tab-content" id="tab-etf">
 {etf_section}
+</div>
+
+<div class="tab-content" id="tab-sector">
+{sector_section}
 </div>
 
 <script>
@@ -1153,8 +1376,10 @@ def main():
     aqr_section = build_aqr_section(aqr_prices, aqr_prices_raw, aqr_returns, aqr_tickers)
     print("  Building ETF section...")
     etf_section = build_etf_section(etf_prices, etf_prices_raw, etf_returns, etf_tickers)
+    print("  Building Sector section...")
+    sector_section = build_sector_section()
 
-    html = generate_report(aqr_section, etf_section)
+    html = generate_report(aqr_section, etf_section, sector_section)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n  Report: {output_path}")
