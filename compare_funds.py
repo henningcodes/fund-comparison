@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import plotly.figure_factory as ff
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy.cluster.hierarchy import linkage
 from scipy.optimize import minimize
 from scipy.spatial.distance import squareform
@@ -887,6 +888,151 @@ def sector_metrics_table_html(metrics_df):
     return f"<table class='sortable'><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
+def _sector_only_prices(prices, broad_labels):
+    """Strip broad indices (S&P 500 / Nasdaq 100 / Stoxx 600) from a price frame."""
+    cols = [c for c in prices.columns if c not in broad_labels]
+    return prices[cols].dropna(how="all")
+
+
+def compute_dispersion_summary(prices, broad_labels):
+    """Top-bottom spreads at multiple horizons + cross-sectional dispersion regime."""
+    sec = _sector_only_prices(prices, broad_labels)
+    if sec.empty or sec.shape[1] < 2:
+        return None
+
+    last = sec.index.max()
+    horizons = [("1W", 7), ("1M", 30), ("3M", 90), ("1Y", 365)]
+    spreads = []
+    for label, days in horizons:
+        cutoff = last - pd.Timedelta(days=days)
+        hist = sec.loc[:cutoff].dropna(how="all")
+        if hist.empty:
+            continue
+        base = hist.iloc[-1]
+        rets = (sec.iloc[-1] / base - 1.0).dropna()
+        if rets.empty:
+            continue
+        spreads.append({
+            "Horizon": label,
+            "Best": rets.idxmax(), "Best Ret": float(rets.max()),
+            "Worst": rets.idxmin(), "Worst Ret": float(rets.min()),
+            "Spread (pp)": float(rets.max() - rets.min()) * 100,
+        })
+
+    daily_rets = sec.pct_change()
+    cs_disp = daily_rets.std(axis=1).rolling(21).mean() * np.sqrt(252)
+    cs_disp_clean = cs_disp.dropna()
+    if cs_disp_clean.empty:
+        return {"spreads": spreads, "current_disp": None, "avg_disp_1y": None,
+                "percentile": None, "regime": None}
+
+    current = float(cs_disp_clean.iloc[-1])
+    one_year_ago = last - pd.DateOffset(years=1)
+    last_year = cs_disp_clean[cs_disp_clean.index >= one_year_ago]
+    avg_1y = float(last_year.mean()) if not last_year.empty else None
+    if last_year.empty:
+        pct_rank, regime = None, None
+    else:
+        pct_rank = float((last_year < current).mean())
+        if pct_rank < 0.33:
+            regime = "narrow"
+        elif pct_rank < 0.66:
+            regime = "normal"
+        else:
+            regime = "wide"
+
+    return {"spreads": spreads, "current_disp": current, "avg_disp_1y": avg_1y,
+            "percentile": pct_rank, "regime": regime}
+
+
+def dispersion_chart(prices, broad_labels, title):
+    """Dual-axis chart: 21d cross-sectional σ (left) + 63d avg pairwise corr (right)."""
+    sec = _sector_only_prices(prices, broad_labels)
+    if sec.empty or sec.shape[1] < 2:
+        return None
+
+    daily_rets = sec.pct_change().dropna(how="all")
+    cs_disp = daily_rets.std(axis=1).rolling(21).mean() * np.sqrt(252)
+
+    window = 63
+    n = len(daily_rets)
+    if n <= window:
+        avg_corr_s = pd.Series(dtype=float)
+    else:
+        avg_corr_vals, idx = [], []
+        for i in range(window, n):
+            win = daily_rets.iloc[i - window:i]
+            c = win.corr().values
+            if c.shape[0] < 2:
+                continue
+            mask = ~np.eye(c.shape[0], dtype=bool)
+            avg_corr_vals.append(np.nanmean(c[mask]))
+            idx.append(daily_rets.index[i])
+        avg_corr_s = pd.Series(avg_corr_vals, index=idx)
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=cs_disp.index, y=cs_disp.values,
+        name="21d cross-sectional σ (annualized)",
+        line=dict(color="#1a1a2e", width=2),
+    ), secondary_y=False)
+    if not avg_corr_s.empty:
+        fig.add_trace(go.Scatter(
+            x=avg_corr_s.index, y=avg_corr_s.values,
+            name="63d avg pairwise correlation",
+            line=dict(color="#d62728", width=2),
+        ), secondary_y=True)
+    fig.update_layout(
+        title=title,
+        template="plotly_white", height=460,
+        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="Cross-sectional σ (annualized)", secondary_y=False)
+    fig.update_yaxes(title_text="Avg pairwise correlation", secondary_y=True, range=[0, 1])
+    return fig
+
+
+def dispersion_summary_html(summary):
+    """Render the regime banner + top-bottom spread table."""
+    if not summary:
+        return ""
+
+    parts = []
+    if summary.get("regime") is not None:
+        color = {"narrow": "#2ca02c", "normal": "#888", "wide": "#d62728"}[summary["regime"]]
+        parts.append(
+            "<p class='note'>Current 21d cross-sectional dispersion (annualized): "
+            f"<strong>{summary['current_disp'] * 100:.1f}%</strong> "
+            f"(1Y average: {summary['avg_disp_1y'] * 100:.1f}%). "
+            "Percentile vs trailing 1Y: "
+            f"<strong style='color:{color}'>{summary['percentile'] * 100:.0f}% — {summary['regime']}</strong>.</p>"
+        )
+
+    spreads = summary.get("spreads") or []
+    if spreads:
+        rows = ""
+        for s in spreads:
+            best_cls = "pos" if s["Best Ret"] >= 0 else "neg"
+            worst_cls = "pos" if s["Worst Ret"] >= 0 else "neg"
+            rows += (
+                f"<tr><td class='fund-name'>{s['Horizon']}</td>"
+                f"<td>{s['Best']}</td>"
+                f"<td class='{best_cls}'>{s['Best Ret'] * 100:+.2f}%</td>"
+                f"<td>{s['Worst']}</td>"
+                f"<td class='{worst_cls}'>{s['Worst Ret'] * 100:+.2f}%</td>"
+                f"<td><strong>{s['Spread (pp)']:.1f} pp</strong></td></tr>"
+            )
+        parts.append(
+            "<table><thead><tr>"
+            "<th>Horizon</th><th>Best Sector</th><th>Best Ret</th>"
+            "<th>Worst Sector</th><th>Worst Ret</th><th>Spread</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table>"
+        )
+
+    return "\n".join(parts)
+
+
 def sector_mapping_table_html(mapping_df):
     """Render the WKN/ISIN/Ticker mapping in the AQR table style."""
     if mapping_df is None or mapping_df.empty:
@@ -930,6 +1076,11 @@ def build_sector_group(group_id, group_title, intro, prices_csv, metrics_csv, ma
     mapping_html = sector_mapping_table_html(mapping)
     last_date = prices.index.max().strftime("%Y-%m-%d") if not prices.empty else "—"
 
+    disp_summary = compute_dispersion_summary(prices, broad_labels)
+    disp_summary_html = dispersion_summary_html(disp_summary) if disp_summary else ""
+    disp_fig = dispersion_chart(prices, broad_labels, f"{group_title} — Dispersion Regime")
+    disp_chart_html = disp_fig.to_html(full_html=False, include_plotlyjs=False) if disp_fig else ""
+
     parts = [f"<h2 id='{group_id}'>{group_title}</h2>"]
     if intro:
         parts.append(f"<p class='note'>{intro} Last data point: {last_date}.</p>")
@@ -939,6 +1090,17 @@ def build_sector_group(group_id, group_title, intro, prices_csv, metrics_csv, ma
     if chart_html:
         parts.append("<h3>Indexed Performance</h3>")
         parts.append(f"<div class='chart-box'>{chart_html}</div>")
+    if disp_summary_html or disp_chart_html:
+        parts.append("<h3>Sector Dispersion</h3>")
+        parts.append(
+            "<p class='note'>Wide top-bottom spreads and high cross-sectional &sigma; indicate "
+            "strong rotation; high average pairwise correlation indicates a single-factor regime "
+            "where everything moves together.</p>"
+        )
+        if disp_summary_html:
+            parts.append(disp_summary_html)
+        if disp_chart_html:
+            parts.append(f"<div class='chart-box'>{disp_chart_html}</div>")
     if mapping_html:
         parts.append("<h3>Instrument Mapping</h3>")
         parts.append(mapping_html)
