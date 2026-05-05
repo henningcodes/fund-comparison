@@ -24,6 +24,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Generate sector data (US + STOXX 600)
+        env:
+          EODHD_API_TOKEN: ${{ secrets.EODHD_API_TOKEN }}
+        working-directory: sector_scripts
+        run: |
+          python eodhd_us_sector_report.py
+          python eodhd_stoxx600_sector_report.py
+
       - name: Generate report
         run: python compare_funds.py
 

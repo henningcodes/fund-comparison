@@ -770,7 +770,7 @@ def returns_table_html(returns_table):
 
 SECTOR_DATA_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "..", "equity-sector-performance", "scripts", "output",
+    "sector_scripts", "output",
 ))
 
 
@@ -915,7 +915,7 @@ def build_sector_group(group_id, group_title, intro, prices_csv, metrics_csv, ma
     if not (os.path.exists(prices_path) and os.path.exists(metrics_path) and os.path.exists(mapping_path)):
         return empty_state_html(
             f"{group_title} data unavailable",
-            f"Run the sector report script in equity-sector-performance/scripts to generate "
+            f"Run the sector report script in sector_scripts/ to generate "
             f"{prices_csv}, {metrics_csv}, {mapping_csv}.",
         )
 

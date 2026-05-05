@@ -3,3 +3,4 @@ __pycache__/
 .env
 public/
 fund_comparison.html
+sector_scripts/output/
