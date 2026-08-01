@@ -105,6 +105,133 @@ def empty_state_html(title, message):
 # Data download
 # ---------------------------------------------------------------------------
 
+DESPIKE_SIGMA = 10.0     # one-day excursion in robust daily sigmas of that fund
+DESPIKE_MIN_REL = 0.03   # ...and at least 3% in absolute terms
+DESPIKE_REVERT = 0.015   # ...and the two neighbours must agree within 1.5%
+
+
+def despike(prices, n_sigma=DESPIKE_SIGMA, min_rel=DESPIKE_MIN_REL,
+            revert=DESPIKE_REVERT, verbose=True):
+    """Remove isolated bad prints from a price frame.
+
+    Yahoo occasionally returns a stray quote that is wildly off and reverts the
+    next day. A single such print creates a matched pair of huge returns (e.g.
+    +25% / -20%) and wrecks every volatility, correlation and optimizer input
+    computed from the full history.
+
+    A point is treated as a bad print only when ALL THREE hold:
+
+      1. EXCURSION vs its neighbours. The reference is the average of the day
+         before and the day after, not a rolling median. Measured against that,
+         the excursion must exceed n_sigma times the fund's own robust daily
+         volatility (MAD of returns x 1.4826).
+      2. It must also be at least min_rel in absolute terms, so a fund in a
+         dead-calm stretch does not get shredded by rounding noise.
+      3. The neighbours must agree with each other within revert -- a bad print
+         leaves no trace, the market resumes exactly where it left off.
+
+    Why the neighbour average rather than a rolling median: it separates the
+    two cases by orders of magnitude. On this data the real bad prints are
+    90-120 sigma excursions, while the worst genuine one-day move that also
+    happens to look symmetric is under 3 sigma. There is no threshold worth
+    arguing about in between.
+
+    Earlier attempts using a Hampel filter on a rolling median flagged real
+    history -- the COVID bottom on FTSE All World (2020-02-28) and the middle
+    of a genuine two-day drawdown on AQR Style Premia (2022-04-05). Both were
+    correct prices; the median-based reference simply could not tell a V-shaped
+    market move from a data error.
+
+    Outliers are replaced by linear interpolation between their neighbours, so
+    the date grid stays intact. Every removal is printed -- silent data surgery
+    is worse than the bad data.
+    """
+    if prices.empty:
+        return prices
+    cleaned = prices.copy()
+    removed = []
+    for col in prices.columns:
+        s = prices[col].dropna()
+        if len(s) < 30:
+            continue
+        r = s.pct_change().dropna()
+        sigma = 1.4826 * (r - r.median()).abs().median()      # robuste Tagesvola
+        if not np.isfinite(sigma) or sigma <= 0:
+            continue
+        prv, nxt = s.shift(1), s.shift(-1)
+        ref = (prv + nxt) / 2.0
+        excursion = (s / ref - 1).abs()
+        neighbours_agree = (prv / nxt - 1).abs() < revert
+        bad = ((excursion > n_sigma * sigma)
+               & (excursion > min_rel)
+               & neighbours_agree).fillna(False)
+        if not bad.any():
+            continue
+        for d in s.index[bad]:
+            removed.append((short_name(col), d, float(s.loc[d]), float(ref.loc[d]),
+                            float(excursion.loc[d] / sigma)))
+        fixed = s.mask(bad).interpolate(method="linear", limit_direction="both")
+        cleaned.loc[fixed.index, col] = fixed
+    if verbose and removed:
+        print(f"\n  Despiking: {len(removed)} bad print(s) replaced")
+        for name, d, was, ref_, sig in removed:
+            print(f"    {name:25s} {d:%Y-%m-%d}  {was:>10.4f}  ->  {ref_:>9.4f}"
+                  f"   ({sig:.0f} sigma)")
+    elif verbose:
+        print("\n  Despiking: no bad prints found")
+    return cleaned
+
+
+TRIM_BREAK = 0.15        # residual daily move that despiking could not repair
+TRIM_MAX_FRACTION = 0.40  # only trim if the damage sits in the first 40% of the series
+
+
+def trim_broken_history(prices, threshold=TRIM_BREAK,
+                        max_fraction=TRIM_MAX_FRACTION, verbose=True):
+    """Cut off an early stretch of history that despiking cannot repair.
+
+    despike() fixes ISOLATED bad prints. It cannot fix a period where bad
+    prints arrive every few days, because then a bad print has another bad
+    print as its neighbour: the "neighbours agree" test fails, and worse, a
+    GOOD price sandwiched between two bad ones gets flagged instead.
+
+    MSCI Japan is the live example: 92 daily moves beyond 15% between
+    2009-11 and 2010-12 (the quote alternates between roughly 17 and 25 --
+    a currency mix-up in the source), then nothing at all. From 2011-01 the
+    series is spotless at 17.6% vol; before that it is unusable at ~50%.
+
+    So: after despiking, look for residual moves beyond `threshold`. If the
+    LAST one still sits inside the first `max_fraction` of the series, treat
+    everything up to it as unusable and start the series after it. The
+    fraction guard matters -- a recent break is news, not a data artifact,
+    and must not silently delete the fund's current history.
+    """
+    if prices.empty:
+        return prices
+    out = prices.copy()
+    for col in prices.columns:
+        s_ = prices[col].dropna()
+        if len(s_) < 60:
+            continue
+        r = s_.pct_change()
+        breaks = r.index[(r.abs() > threshold).fillna(False)]
+        if len(breaks) == 0:
+            continue
+        last_break = breaks.max()
+        pos = s_.index.get_loc(last_break)
+        if pos > len(s_) * max_fraction:
+            if verbose:
+                print(f"    {short_name(col):25s} {len(breaks)} residual break(s), latest "
+                      f"{last_break:%Y-%m-%d} -- too recent to trim, LEFT AS IS")
+            continue
+        out.loc[out.index <= last_break, col] = np.nan
+        if verbose:
+            kept = s_.index[pos + 1]
+            print(f"    {short_name(col):25s} {len(breaks)} break(s) up to {last_break:%Y-%m-%d}"
+                  f" -- dropped {pos + 1} obs, series now starts {kept:%Y-%m-%d}")
+    return out
+
+
 def download_prices(tickers):
     """Download daily close prices via yfinance using ISINs."""
     all_prices = {}
@@ -122,7 +249,9 @@ def download_prices(tickers):
                 print("  NO DATA")
         except Exception as e:
             print(f"  ERROR: {e}")
-    return pd.DataFrame(all_prices)
+    px = despike(pd.DataFrame(all_prices))
+    print("  Trimming unrepairable history:")
+    return trim_broken_history(px)
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +305,17 @@ def compute_returns_table(prices, last_valid=None):
 
         daily_rets = s.pct_change().dropna()
         if len(daily_rets) > 20:
-            ann_vol = daily_rets.std() * np.sqrt(252)
-            row["Vol (ann.)"] = ann_vol
-
+            # Vol ueber das LETZTE JAHR, nicht ueber die ganze Historie. Zwei Gruende:
+            #  1) einheitliches Fenster mit Sharpe (1Y) und UPI (1Y) -- sonst passen die
+            #     Kennzahlen der Tabelle nicht zueinander
+            #  2) eine Vol ueber 8+ Jahre mischt laengst vergangene Regime bei und reagiert
+            #     kaum noch auf das aktuelle Risiko des Fonds
             one_year_ago = last_date - pd.DateOffset(years=1)
             rets_1y = daily_rets[daily_rets.index >= one_year_ago]
             if len(rets_1y) > 20:
-                ann_ret_1y = rets_1y.mean() * 252
                 ann_vol_1y = rets_1y.std() * np.sqrt(252)
+                row["Vol (ann.)"] = ann_vol_1y
+                ann_ret_1y = rets_1y.mean() * 252
                 if ann_vol_1y > 0:
                     row["Sharpe (1Y)"] = ann_ret_1y / ann_vol_1y
 
@@ -278,6 +410,195 @@ def performance_chart(prices, chart_id_prefix="perf"):
     fig.update_layout(
         title="Indexed Performance (All)",
         yaxis_title="Growth of 1.0",
+        template="plotly_white", height=520,
+        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
+        hovermode="x unified",
+        updatemenus=[dict(
+            type="buttons",
+            direction="right",
+            x=1.0, xanchor="right",
+            y=1.18, yanchor="top",
+            buttons=buttons,
+            bgcolor="#e8e8e8",
+            font=dict(size=12),
+        )],
+    )
+    return fig
+
+
+TARGET_VOL = 0.10      # every fund is rescaled to this annualized volatility
+ANNUAL_RF = 0.02       # assumed risk-free rate; only the EXCESS return is levered
+
+
+def _funding_label(k, annual_rf):
+    """Annual funding cost (k>1) or cash credit (k<1) implied by the scaling."""
+    cost = (k - 1.0) * annual_rf
+    if cost >= 0:
+        return f"funding cost {cost*100:.2f}%/yr"
+    return f"cash credit {-cost*100:.2f}%/yr"
+
+
+def funding_range_note(prices, target_vol=TARGET_VOL, annual_rf=ANNUAL_RF):
+    """Sentence describing how large the implied funding costs actually are.
+
+    Computed on the full common window, i.e. the 'All' view.
+    """
+    if prices is None or prices.empty:
+        return ""
+    prices = prices.dropna(axis=1, how="all")
+    starts = prices.apply(lambda s: s.dropna().index.min())
+    common_start = starts.max()
+    if pd.isna(common_start):
+        return ""
+    trimmed = prices[prices.index >= common_start]
+    rf_daily = annual_rf / 252.0
+    rows = []
+    for col in trimmed.columns:
+        s = trimmed[col].dropna()
+        if len(s) < 3:
+            continue
+        ex = s.pct_change().dropna() - rf_daily
+        vol = ex.std() * np.sqrt(252)
+        if not np.isfinite(vol) or vol <= 0:
+            continue
+        rows.append((short_name(col), target_vol / vol))
+    if not rows:
+        return ""
+    rows.sort(key=lambda x: x[1])
+    lo_name, lo_k = rows[0]
+    hi_name, hi_k = rows[-1]
+    lo_c = (lo_k - 1) * annual_rf * 100
+    hi_c = (hi_k - 1) * annual_rf * 100
+    return (
+        f"Funding costs are included: scaling the excess return is the same as holding the fund "
+        f"at k times its size and financing the extra (k−1) at the {annual_rf*100:.1f}% "
+        f"risk-free rate. Over the full window this ranges from {hi_c:+.2f}%/yr for "
+        f"{hi_name} (k = {hi_k:.2f}×, the most levered) down to {lo_c:+.2f}%/yr for "
+        f"{lo_name} (k = {lo_k:.2f}× — de-levered funds hold the unused cash and earn "
+        f"the rate instead of paying it). Real financing is dearer than the risk-free rate, "
+        f"so this is a floor."
+    )
+
+
+def vol_normalized_chart(prices, target_vol=TARGET_VOL, annual_rf=ANNUAL_RF):
+    """All funds rescaled to a common volatility, then indexed to 1.0.
+
+    Comparing raw performance mixes two things: how good a fund is and how much
+    risk it took. A fund with twice the volatility should earn twice the return
+    just for taking twice the risk -- that tells you nothing about skill.
+
+    Here each fund's EXCESS return over cash is levered by a constant factor
+    k = target_vol / realized_vol, and cash is added back:
+
+        excess = r - rf_daily
+        k      = target_vol / (std(excess) * sqrt(252))
+        scaled = excess * k + rf_daily
+
+    Only the excess return is scaled -- levering the total return would also
+    lever the cash component, which is not a risk-bearing part of the return.
+
+    FUNDING COSTS ARE INCLUDED. Scaling the excess return is algebraically the
+    same as holding the fund at k times its size and financing the extra (k-1)
+    at the risk-free rate:
+
+        k*r_fund - (k-1)*rf  ==  k*(r_fund - rf) + rf  ==  k*excess + rf
+
+    So a fund levered to k = 3 pays (3-1) * rf = 2 * rf per year in funding.
+    Mirror image for k < 1: the unused (1-k) sits in cash and EARNS rf, which
+    is why de-levered funds get a small credit rather than a cost. Real-world
+    financing is of course dearer than the risk-free rate -- the funding drag
+    shown here is a floor, not a quote.
+
+    Every line therefore has the same ~target_vol volatility WITHIN the shown
+    window, so the ending value is directly the risk-adjusted ranking: whoever
+    ends highest delivered the most return per unit of risk.
+
+    The scaling factor is recomputed PER TIMEFRAME, so each window is
+    self-contained. Caveat: over 1M that is ~21 observations, which makes the
+    volatility estimate noisy -- read the short windows with care.
+    """
+    if prices.empty:
+        return None
+
+    prices = prices.dropna(axis=1, how="all")
+    if prices.empty:
+        return None
+
+    latest = prices.index.max()
+    starts = prices.apply(lambda s: s.dropna().index.min())
+    common_start = starts.max()
+    if pd.isna(common_start):
+        return None
+
+    timeframes = {
+        "1M": latest - pd.DateOffset(months=1),
+        "3M": latest - pd.DateOffset(months=3),
+        "1Y": latest - pd.DateOffset(years=1),
+        "All": common_start,
+    }
+    rf_daily = annual_rf / 252.0
+
+    fig = go.Figure()
+    buttons = []
+    trace_groups = []
+    for tf_label, tf_start in timeframes.items():
+        start = max(tf_start, common_start)
+        trimmed = prices[prices.index >= start]
+        trace_indices = []
+        for i, col in enumerate(trimmed.columns):
+            s = trimmed[col].dropna()
+            if len(s) < 3:
+                continue
+            r = s.pct_change().dropna()
+            excess = r - rf_daily
+            vol = excess.std() * np.sqrt(252)
+            if not np.isfinite(vol) or vol <= 0:
+                continue
+            k = target_vol / vol
+            scaled = excess * k + rf_daily
+            nav = (1 + scaled).cumprod()
+            # start the line at 1.0 on the window's first date
+            nav = pd.concat([pd.Series([1.0], index=[s.index[0]]), nav])
+            fig.add_trace(go.Scatter(
+                x=nav.index, y=nav.values,
+                mode="lines", name=short_name(col),
+                line=dict(color=COLORS[i % len(COLORS)], width=2),
+                visible=(tf_label == "All"),
+                showlegend=(tf_label == "All"),
+                hovertemplate=(f"<b>{short_name(col)}</b><br>%{{y:.3f}}"
+                               f"<br>vol {vol*100:.1f}% -> x{k:.2f}"
+                               f"<br>{_funding_label(k, annual_rf)}<extra></extra>"),
+            ))
+            trace_indices.append(len(fig.data) - 1)
+        trace_groups.append(trace_indices)
+
+    if not fig.data:
+        return None
+
+    total_traces = len(fig.data)
+    for tf_label, trace_indices in zip(timeframes.keys(), trace_groups):
+        vis = [False] * total_traces
+        for idx in trace_indices:
+            vis[idx] = True
+        buttons.append(dict(
+            label=tf_label,
+            method="update",
+            args=[
+                {"visible": vis},
+                {"title": f"Indexed Vol Normalized Performance ({tf_label})"},
+            ],
+        ))
+
+    fig.add_annotation(
+        text=(f"Excess return over a {annual_rf*100:.1f}% risk-free rate levered to "
+              f"{target_vol*100:.0f}% vol — funding of the levered part is charged at "
+              f"that same rate"),
+        xref="paper", yref="paper", x=0, y=-0.16, xanchor="left", yanchor="top",
+        showarrow=False, font=dict(size=11, color="#666"),
+    )
+    fig.update_layout(
+        title="Indexed Vol Normalized Performance (All)",
+        yaxis_title=f"Growth of 1.0 at {target_vol*100:.0f}% vol",
         template="plotly_white", height=520,
         legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
         hovermode="x unified",
@@ -733,7 +1054,7 @@ def returns_table_html(returns_table):
         "Start": "Start Date", "Last Date": "Last Price Date", "Last Price": "Last Price",
         "1M": "1 Month", "3M": "3 Months",
         "1Y": "1 Year", "Max": "Max (total)", "Max (p.a.)": "Max (p.a.)",
-        "Vol (ann.)": "Vol (ann.)", "Sharpe (1Y)": "Sharpe (1Y)",
+        "Vol (ann.)": "Vol (ann., 1Y)", "Sharpe (1Y)": "Sharpe (1Y)",
         "UPI (1Y)": "UPI (1Y)",
     }
     cols = [c for c in display_cols if c in returns_table.columns]
@@ -1165,6 +1486,7 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     ]
 
     fig1 = performance_chart(prices)
+    fig1n = vol_normalized_chart(prices)
     fig2 = rolling_correlation_chart(prices_raw, aqr_names, benchmark_name) if benchmark_name else None
     fig3 = correlation_heatmap(prices_raw)
     fig4 = return_dendrogram(prices_raw)
@@ -1178,6 +1500,7 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     stress_tbl = stress_test_html(stress_df, short_name(benchmark_name)) if stress_df is not None else ""
     port_stats_tbl, port_weights_tbl = portfolio_stats_html(port_stats, port_weights) if port_stats is not None else ("", "")
     c1 = fig1.to_html(full_html=False, include_plotlyjs=False) if fig1 else ""
+    c1n = fig1n.to_html(full_html=False, include_plotlyjs=False) if fig1n else ""
     c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
     c3 = fig3.to_html(full_html=False, include_plotlyjs=False) if fig3 else ""
     c4 = fig4.to_html(full_html=False, include_plotlyjs=False) if fig4 else ""
@@ -1199,7 +1522,16 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     if c1:
         sections.extend([
             "<h2>Indexed Performance</h2>",
-            f'<div class="chart-box">{c1}</div>',
+            "<p class=\"note\">Left: raw performance. Right: every fund rescaled to "
+            f"{TARGET_VOL*100:.0f}% annualized volatility. On the right the ending value is the "
+            "risk-adjusted ranking — differences in volatility no longer flatter the "
+            "higher-risk funds. Scaling is recomputed per timeframe; hover shows each fund's "
+            "realized vol, applied factor and funding cost.</p>",
+            f"<p class=\"note\">{funding_range_note(prices)}</p>",
+            '<div class="chart-row">'
+            f'<div class="chart-box">{c1}</div>'
+            f'<div class="chart-box">{c1n}</div>'
+            "</div>" if c1n else f'<div class="chart-box">{c1}</div>',
         ])
     if c3:
         sections.extend([
@@ -1263,6 +1595,7 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     ]
 
     fig1 = performance_chart(prices)
+    fig1n = vol_normalized_chart(prices)
     fig_corr_bar = correlation_vs_benchmark_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
     fig2 = rolling_correlation_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
     fig3 = correlation_heatmap(prices_raw)
@@ -1277,6 +1610,7 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     stress_tbl = stress_test_html(stress_df, short_name(benchmark_name)) if stress_df is not None else ""
     port_stats_tbl, port_weights_tbl = portfolio_stats_html(port_stats, port_weights) if port_stats is not None else ("", "")
     c1 = fig1.to_html(full_html=False, include_plotlyjs=False) if fig1 else ""
+    c1n = fig1n.to_html(full_html=False, include_plotlyjs=False) if fig1n else ""
     c_bar = fig_corr_bar.to_html(full_html=False, include_plotlyjs=False) if fig_corr_bar else ""
     c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
     c3 = fig3.to_html(full_html=False, include_plotlyjs=False) if fig3 else ""
@@ -1306,7 +1640,16 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     if c1:
         sections.extend([
             "<h2>Indexed Performance</h2>",
-            f'<div class="chart-box">{c1}</div>',
+            "<p class=\"note\">Left: raw performance. Right: every fund rescaled to "
+            f"{TARGET_VOL*100:.0f}% annualized volatility. On the right the ending value is the "
+            "risk-adjusted ranking — differences in volatility no longer flatter the "
+            "higher-risk funds. Scaling is recomputed per timeframe; hover shows each fund's "
+            "realized vol, applied factor and funding cost.</p>",
+            f"<p class=\"note\">{funding_range_note(prices)}</p>",
+            '<div class="chart-row">'
+            f'<div class="chart-box">{c1}</div>'
+            f'<div class="chart-box">{c1n}</div>'
+            "</div>" if c1n else f'<div class="chart-box">{c1}</div>',
         ])
     if c3:
         sections.extend([
@@ -1391,6 +1734,14 @@ def generate_report(aqr_section, etf_section, sector_section):
   .chart-box {{
     background: #fff; border-radius: 8px; padding: 15px; margin: 20px 0;
     box-shadow: 0 1px 3px rgba(0,0,0,.12);
+  }}
+  /* Zwei Charts nebeneinander; auf schmalen Schirmen untereinander. */
+  .chart-row {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+  }}
+  .chart-row > .chart-box {{ margin: 20px 0; min-width: 0; }}
+  @media (max-width: 1400px) {{
+    .chart-row {{ grid-template-columns: 1fr; }}
   }}
   .empty-state {{
     background: #fff7e6; border: 1px solid #f1d28a; border-radius: 8px;
