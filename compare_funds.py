@@ -408,16 +408,18 @@ def performance_chart(prices, chart_id_prefix="perf"):
         ))
 
     fig.update_layout(
-        title="Indexed Performance (All)",
+        # t=130 schafft Platz fuer Titel UND die zweizeilige Legende darunter;
+        # mit dem Default ueberlagerte die Legende den Titel.
+        title=dict(text="Indexed Performance (All)", y=0.97, yanchor="top"),
         yaxis_title="Growth of 1.0",
-        template="plotly_white", height=520,
-        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
+        template="plotly_white", height=560, margin=dict(t=130, b=60),
+        legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center"),
         hovermode="x unified",
         updatemenus=[dict(
             type="buttons",
             direction="right",
             x=1.0, xanchor="right",
-            y=1.18, yanchor="top",
+            y=1.13, yanchor="bottom",
             buttons=buttons,
             bgcolor="#e8e8e8",
             font=dict(size=12),
@@ -597,16 +599,16 @@ def vol_normalized_chart(prices, target_vol=TARGET_VOL, annual_rf=ANNUAL_RF):
         showarrow=False, font=dict(size=11, color="#666"),
     )
     fig.update_layout(
-        title="Indexed Vol Normalized Performance (All)",
+        title=dict(text="Indexed Vol Normalized Performance (All)", y=0.97, yanchor="top"),
         yaxis_title=f"Growth of 1.0 at {target_vol*100:.0f}% vol",
-        template="plotly_white", height=520,
-        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center"),
+        template="plotly_white", height=600, margin=dict(t=130, b=90),
+        legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center"),
         hovermode="x unified",
         updatemenus=[dict(
             type="buttons",
             direction="right",
             x=1.0, xanchor="right",
-            y=1.18, yanchor="top",
+            y=1.13, yanchor="bottom",
             buttons=buttons,
             bgcolor="#e8e8e8",
             font=dict(size=12),
@@ -1522,16 +1524,19 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     if c1:
         sections.extend([
             "<h2>Indexed Performance</h2>",
-            "<p class=\"note\">Left: raw performance. Right: every fund rescaled to "
-            f"{TARGET_VOL*100:.0f}% annualized volatility. On the right the ending value is the "
-            "risk-adjusted ranking — differences in volatility no longer flatter the "
-            "higher-risk funds. Scaling is recomputed per timeframe; hover shows each fund's "
-            "realized vol, applied factor and funding cost.</p>",
+            f'<div class="chart-box">{c1}</div>',
+        ])
+    if c1n:
+        sections.extend([
+            "<h2>Indexed Vol Normalized Performance</h2>",
+            f"<p class=\"note\">The same funds, each rescaled to {TARGET_VOL*100:.0f}% "
+            "annualized volatility. Raw performance mixes skill with risk taken — a fund "
+            "running twice the volatility should earn twice the return for that alone. Here "
+            "every line carries the same risk, so the ending value <em>is</em> the "
+            "risk-adjusted ranking. Scaling is recomputed per timeframe; hover shows each "
+            "fund's realized vol, applied factor and funding cost.</p>",
             f"<p class=\"note\">{funding_range_note(prices)}</p>",
-            '<div class="chart-row">'
-            f'<div class="chart-box">{c1}</div>'
-            f'<div class="chart-box">{c1n}</div>'
-            "</div>" if c1n else f'<div class="chart-box">{c1}</div>',
+            f'<div class="chart-box">{c1n}</div>',
         ])
     if c3:
         sections.extend([
@@ -1640,16 +1645,19 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     if c1:
         sections.extend([
             "<h2>Indexed Performance</h2>",
-            "<p class=\"note\">Left: raw performance. Right: every fund rescaled to "
-            f"{TARGET_VOL*100:.0f}% annualized volatility. On the right the ending value is the "
-            "risk-adjusted ranking — differences in volatility no longer flatter the "
-            "higher-risk funds. Scaling is recomputed per timeframe; hover shows each fund's "
-            "realized vol, applied factor and funding cost.</p>",
+            f'<div class="chart-box">{c1}</div>',
+        ])
+    if c1n:
+        sections.extend([
+            "<h2>Indexed Vol Normalized Performance</h2>",
+            f"<p class=\"note\">The same funds, each rescaled to {TARGET_VOL*100:.0f}% "
+            "annualized volatility. Raw performance mixes skill with risk taken — a fund "
+            "running twice the volatility should earn twice the return for that alone. Here "
+            "every line carries the same risk, so the ending value <em>is</em> the "
+            "risk-adjusted ranking. Scaling is recomputed per timeframe; hover shows each "
+            "fund's realized vol, applied factor and funding cost.</p>",
             f"<p class=\"note\">{funding_range_note(prices)}</p>",
-            '<div class="chart-row">'
-            f'<div class="chart-box">{c1}</div>'
-            f'<div class="chart-box">{c1n}</div>'
-            "</div>" if c1n else f'<div class="chart-box">{c1}</div>',
+            f'<div class="chart-box">{c1n}</div>',
         ])
     if c3:
         sections.extend([
@@ -1734,14 +1742,6 @@ def generate_report(aqr_section, etf_section, sector_section):
   .chart-box {{
     background: #fff; border-radius: 8px; padding: 15px; margin: 20px 0;
     box-shadow: 0 1px 3px rgba(0,0,0,.12);
-  }}
-  /* Zwei Charts nebeneinander; auf schmalen Schirmen untereinander. */
-  .chart-row {{
-    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-  }}
-  .chart-row > .chart-box {{ margin: 20px 0; min-width: 0; }}
-  @media (max-width: 1400px) {{
-    .chart-row {{ grid-template-columns: 1fr; }}
   }}
   .empty-state {{
     background: #fff7e6; border: 1px solid #f1d28a; border-radius: 8px;
