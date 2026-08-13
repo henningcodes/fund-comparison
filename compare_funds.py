@@ -27,6 +27,7 @@ Tab 3 – Sector Performance:
 import datetime as dt
 import os
 import sys
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -1697,8 +1698,340 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     return "\n".join(sections)
 
 
-def generate_report(aqr_section, etf_section, sector_section):
-    """Wrap three tab sections into a complete HTML page."""
+# ---------------------------------------------------------------------------
+# Tab 4 - Maximum Diversification (cardinality-constrained)
+# ---------------------------------------------------------------------------
+
+DIV_N_ASSETS = 5          # wanted portfolio size (hard cardinality constraint)
+DIV_MIN_WEIGHT = 0.10     # floor so a "5-asset" portfolio really holds 5
+
+# Zwei Fenster, weil sich Fondsauswahl und Krisen-Abdeckung direkt widersprechen:
+# jeder junge Fonds, den man aufnimmt, schneidet das GEMEINSAME Fenster vorne ab.
+# Gefiltert wird deshalb nach STARTDATUM, nicht nach Anzahl Handelstage - die
+# Tageszahl sagt nichts darueber, wie weit eine Reihe zurueckreicht (AQR Alt Trends
+# hat 787 Tage, beginnt aber erst 2023-03 und kostet damit die 2022-Korrektur).
+DIV_PANELS = [
+    (4.0, "Long window", "includes the 2022 equity/bond selloff - the only real "
+                         "stress event in this data, so this is the window that "
+                         "actually speaks to crisis behaviour"),
+    (2.0, "Recent window", "more funds qualify, but the window contains no crisis - "
+                           "treat the correlations as fair-weather estimates"),
+]
+
+
+def _mdp_weights(corr, vols):
+    """Maximum-diversification weights, solved as a CONVEX problem.
+
+    DR(w) = (w'sigma) / sqrt(w' Sigma w). Substituting y = w*sigma and
+    Sigma = D C D gives DR = sum(y) / sqrt(y'Cy), so under sum(y)=1 maximising DR
+    is exactly minimising y'Cy with y >= 0 -- convex, unique optimum. Recover
+    w ~ y/sigma. Maximising DR directly in w is non-convex and can land in a
+    local optimum, which is why this substitution is worth the extra step.
+    """
+    n = len(vols)
+    res = minimize(lambda y: y @ corr @ y, np.ones(n) / n, method="SLSQP",
+                   bounds=[(0.0, 1.0)] * n,
+                   constraints=[{"type": "eq", "fun": lambda y: y.sum() - 1.0}],
+                   options={"maxiter": 500, "ftol": 1e-12})
+    w = np.clip(res.x, 0, None) / vols
+    return w / w.sum()
+
+
+def _solve_weights(objective, n, lo, n_start=25, seed=0):
+    """Multi-start SLSQP on the simplex for the non-convex objectives (ERC, ENB,
+    and DR once weight floors break the convex substitution)."""
+    rng = np.random.default_rng(seed)
+    cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+    bounds = [(lo, 1.0)] * n
+    starts = [np.full(n, 1.0 / n)]
+    starts += [lo + (1 - lo * n) * rng.dirichlet(np.ones(n)) for _ in range(n_start - 1)]
+    best, best_v = starts[0], np.inf
+    for s in starts:
+        res = minimize(objective, s, method="SLSQP", bounds=bounds,
+                       constraints=cons, options={"maxiter": 400, "ftol": 1e-12})
+        if res.success and res.fun < best_v:
+            best_v, best = res.fun, res.x
+    return best
+
+
+def _div_ratio(w, cov, vols):
+    pv = np.sqrt(w @ cov @ w)
+    return float((w @ vols) / pv) if pv > 1e-12 else np.nan
+
+
+def _risk_shares(w, cov):
+    """Anteil jedes Assets an der Portfolio-Varianz (Euler-Zerlegung)."""
+    pv = w @ cov @ w
+    return (w * (cov @ w)) / pv if pv > 1e-12 else np.full(len(w), np.nan)
+
+
+def _enb(w, cov):
+    """Effective Number of Bets: Entropie der Risikoverteilung ueber die
+    UNKORRELIERTEN Hauptkomponenten von Sigma.
+
+    Das ist das Mass, das 'moeglichst orthogonal / breit' woertlich nimmt:
+    ENB = 1 heisst, das ganze Risiko haengt an EINEM Faktor; ENB = N heisst,
+    es verteilt sich gleichmaessig auf N unabhaengige Risikoquellen. Die
+    Diversification Ratio misst das NICHT - sie belohnt niedrige Portfolio-Vol
+    und kann dabei in einen einzigen Faktor laufen.
+
+    Caveat: die Hauptkomponenten sind eine Basiswahl (Meuccis Minimum-Torsion
+    waere die basis-unabhaengige Variante); als Vergleichsmass zwischen
+    Portfolios auf DEMSELBEN Universum ist die PCA-Variante aussagekraeftig.
+    """
+    lam, vec = np.linalg.eigh(cov)
+    lam = np.clip(lam, 1e-16, None)
+    v = vec.T @ w
+    c = (v ** 2) * lam
+    tot = c.sum()
+    if tot <= 1e-16:
+        return np.nan
+    p = c / tot
+    p = p[p > 1e-12]
+    return float(np.exp(-(p * np.log(p)).sum()))
+
+
+def _schemes(cov, vols, corr, lo):
+    """Die vier Gewichtungs-Logiken, die auf der Seite verglichen werden."""
+    n = len(vols)
+    ew = np.full(n, 1.0 / n)
+
+    def erc_obj(w):
+        return float(((_risk_shares(w, cov) - 1.0 / n) ** 2).sum())
+
+    def neg_dr(w):
+        return -_div_ratio(w, cov, vols)
+
+    def neg_enb(w):
+        return -_enb(w, cov)
+
+    return {
+        "Equal Weight": ew,
+        "Max Diversification (DR)": (_mdp_weights(corr, vols) if lo <= 0
+                                     else _solve_weights(neg_dr, n, lo)),
+        "Equal Risk Contribution": _solve_weights(erc_obj, n, lo),
+        "Max Effective Bets (ENB)": _solve_weights(neg_enb, n, lo),
+    }
+
+
+def _port_stats(w, rets):
+    pr = rets.values @ w
+    eq = (1 + pd.Series(pr, index=rets.index)).cumprod()
+    ann = float(eq.iloc[-1] ** (252 / len(pr)) - 1)
+    vol = float(pr.std() * np.sqrt(252))
+    mdd = float((eq / eq.cummax() - 1).min())
+    return ann, vol, mdd, eq
+
+
+def _div_panel(prices, benchmark_name, min_years, label, blurb):
+    """Ein Fenster-Panel: Vollenumeration + Gewichtungsvarianten + Krisen-Check."""
+    # 1) Kandidaten nach STARTDATUM filtern (s. DIV_PANELS): ein Fonds ist nur
+    #    dabei, wenn er min_years zurueckreicht - sonst kuerzt er allen anderen
+    #    das gemeinsame Fenster weg.
+    last = max(prices[c].dropna().index.max() for c in prices.columns)
+    cutoff = last - pd.Timedelta(days=int(min_years * 365.25))
+    starts = {c: prices[c].dropna().index.min() for c in prices.columns}
+    keep = [c for c in prices.columns if starts[c] <= cutoff]
+    dropped = sorted(((c, starts[c]) for c in prices.columns if c not in keep),
+                     key=lambda t: t[1])
+    if len(keep) < DIV_N_ASSETS:
+        return empty_state_html(
+            f"Maximum Diversification &mdash; {label}",
+            f"Only {len(keep)} fund(s) reach back {min_years:g} years "
+            f"(before {cutoff.date()}) - need {DIV_N_ASSETS}.")
+
+    # 2) EIN gemeinsames Fenster fuer ALLE Kandidaten. Liesse man jede Teilmenge
+    #    ihr eigenes Fenster nutzen, waeren die DR-Werte nicht vergleichbar
+    #    (langes ruhiges Fenster vs. kurzes turbulentes).
+    win = prices[keep].dropna()
+    rets = win.pct_change().dropna()
+    if len(rets) < 60:
+        return empty_state_html(f"Maximum Diversification &mdash; {label}",
+                                "Common window too short for a covariance estimate.")
+
+    cov_all = rets.cov().values * 252
+    vol_all = np.sqrt(np.diag(cov_all))
+    idx = {c: i for i, c in enumerate(keep)}
+
+    # 3) Vollenumeration aller Teilmengen - C(n,5) ist klein genug fuer exakt
+    #    statt heuristisch.
+    rows = []
+    for sub in combinations(keep, DIV_N_ASSETS):
+        ii = [idx[c] for c in sub]
+        cov = cov_all[np.ix_(ii, ii)]
+        vols = vol_all[ii]
+        corr = cov / np.outer(vols, vols)
+        w = _mdp_weights(corr, vols)
+        ann, vol, mdd, _ = _port_stats(w, rets[list(sub)])
+        rows.append(dict(sub=sub, w=w, dr=_div_ratio(w, cov, vols),
+                         enb=_enb(w, cov), ann=ann, vol=vol, mdd=mdd,
+                         corr=float(corr[np.triu_indices(len(sub), 1)].mean())))
+    rows.sort(key=lambda d: -d["dr"])
+
+    top_rows = "".join(
+        f"<tr><td class='fund-name'>{' + '.join(r['sub'])}</td>"
+        f"<td>{r['dr']:.2f}</td><td>{r['enb']:.2f}</td>"
+        f"<td class='{'pos' if r['ann'] >= 0 else 'neg'}'>{r['ann']:+.1%}</td>"
+        f"<td>{r['vol']:.1%}</td><td>{r['ann'] / r['vol'] if r['vol'] else float('nan'):.2f}</td>"
+        f"<td class='neg'>{r['mdd']:.1%}</td><td>{r['corr']:+.2f}</td></tr>"
+        for r in rows[:10])
+
+    # 4) Gewichtungs-Varianten fuer die beste Kombination
+    best = rows[0]
+    sub = list(best["sub"])
+    ii = [idx[c] for c in sub]
+    cov = cov_all[np.ix_(ii, ii)]
+    vols = vol_all[ii]
+    corr = cov / np.outer(vols, vols)
+    sub_rets = rets[sub]
+
+    schemes = _schemes(cov, vols, corr, lo=0.0)
+    schemes.update({f"{k} · min {DIV_MIN_WEIGHT:.0%}": v
+                    for k, v in _schemes(cov, vols, corr, lo=DIV_MIN_WEIGHT).items()
+                    if k.startswith("Max Diversification")})
+
+    curves, scheme_rows = {}, ""
+    for name, w in schemes.items():
+        ann, vol, mdd, eq = _port_stats(w, sub_rets)
+        curves[name] = eq / eq.iloc[0] * 100
+        wt = "".join(f"<td>{x:.0%}</td>" for x in w)
+        scheme_rows += (
+            f"<tr><td class='fund-name'>{name}</td>{wt}"
+            f"<td>{_div_ratio(w, cov, vols):.2f}</td><td>{_enb(w, cov):.2f}</td>"
+            f"<td class='{'pos' if ann >= 0 else 'neg'}'>{ann:+.1%}</td>"
+            f"<td>{vol:.1%}</td><td>{ann / vol if vol else float('nan'):.2f}</td>"
+            f"<td class='neg'>{mdd:.1%}</td></tr>")
+
+    fig = go.Figure()
+    for name, eq in curves.items():
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=name))
+    fig.update_layout(height=430, margin=dict(l=50, r=20, t=30, b=40),
+                      yaxis_title="Indexed (100 = start)", hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.18))
+    slug = "".join(ch for ch in label.lower() if ch.isalnum())
+    chart = fig.to_html(full_html=False, include_plotlyjs=False,
+                        div_id=f"div-portfolio-chart-{slug}")
+
+    # 5) Krisen-Check: in den schlechtesten Benchmark-Wochen - war etwas im Plus?
+    crisis = ""
+    if benchmark_name and (benchmark_name in rets.columns or benchmark_name in win.columns):
+        bench_rets = (win[benchmark_name].pct_change().dropna()
+                      if benchmark_name in win.columns else rets[benchmark_name])
+        wk = (1 + rets[sub]).resample("W").prod() - 1
+        bwk = (1 + bench_rets).resample("W").prod() - 1
+        both = pd.concat([wk, bwk.rename("__bench")], axis=1).dropna()
+        worst = both.nsmallest(10, "__bench")
+        w_best = schemes["Max Diversification (DR)"]
+        hits = 0
+        crisis_rows = ""
+        for ts, row in worst.iterrows():
+            s = row[sub]
+            pos = s[s > 0]
+            hits += len(pos) > 0
+            crisis_rows += (
+                f"<tr><td class='fund-name'>{ts.date()}</td>"
+                f"<td class='neg'>{row['__bench']:+.2%}</td>"
+                f"<td class='{'pos' if (s @ w_best) >= 0 else 'neg'}'>{s @ w_best:+.2%}</td>"
+                f"<td>{len(pos)} / {len(sub)}</td>"
+                f"<td class='fund-name'>{s.idxmax()}</td>"
+                f"<td class='{'pos' if s.max() >= 0 else 'neg'}'>{s.max():+.2%}</td></tr>")
+        crisis = f"""
+<h3>Crisis behaviour &mdash; the 10 worst weeks for {benchmark_name}</h3>
+<p class="note">The goal is that <em>something</em> in the book is green and can be
+ sold. That property comes from which assets you hold, not how you weight them.
+ In <strong>{hits} of {len(worst)}</strong> of the worst weeks at least one holding
+ was positive.</p>
+<table class="sortable">
+<thead><tr><th>Week</th><th>{benchmark_name}</th><th>Portfolio (MDP)</th>
+  <th>Holdings positive</th><th>Best holding</th><th>Its return</th></tr></thead>
+<tbody>{crisis_rows}</tbody></table>"""
+
+    drop_note = (" Too short for this window: "
+                 + ", ".join(f"{c} (from {d.date()})" for c, d in dropped) + "."
+                 if dropped else "")
+    head = "".join(f"<th>{c}</th>" for c in sub)
+
+    return f"""
+<h2>{label} &mdash; best {DIV_N_ASSETS}-asset portfolio</h2>
+<p class="note">
+ {blurb}.<br>
+ All <strong>{len(rows)}</strong> possible {DIV_N_ASSETS}-asset combinations of
+ {len(keep)} candidates solved exactly (full enumeration, no heuristic).
+ Common window <strong>{rets.index.min().date()} &rarr; {rets.index.max().date()}</strong>
+ ({len(rets)} days) &mdash; identical for every combination, so the numbers are
+ comparable.{drop_note}
+</p>
+
+<h3>Top 10 combinations by diversification ratio</h3>
+<table class="sortable">
+<thead><tr><th>Portfolio</th><th>DR</th><th>ENB</th><th>Return p.a.</th><th>Vol</th>
+  <th>Sharpe</th><th>Max DD</th><th>&#216; Corr</th></tr></thead>
+<tbody>{top_rows}</tbody></table>
+
+<h3>Weighting schemes for the winner</h3>
+<p class="note">Same five assets, four definitions of "diversified". Note how the
+ unconstrained DP optimum concentrates capital in the lowest-vol asset &mdash; the
+ <em>min {DIV_MIN_WEIGHT:.0%}</em> row shows what a genuinely {DIV_N_ASSETS}-asset
+ book costs in DR and buys in return.</p>
+<table class="sortable">
+<thead><tr><th>Scheme</th>{head}<th>DR</th><th>ENB</th><th>Return p.a.</th>
+  <th>Vol</th><th>Sharpe</th><th>Max DD</th></tr></thead>
+<tbody>{scheme_rows}</tbody></table>
+
+<div class="chart-box">{chart}</div>
+{crisis}
+"""
+
+
+def build_diversification_section(prices, tickers):
+    """Tab 4: bestes N-Asset-Portfolio nach Diversifikation + Krisen-Diagnostik.
+
+    prices: pre-ffill (prices_raw) - Korrelationen duerfen nur auf echten
+            Handelstagen beruhen, ffill erzeugt kuenstliche Null-Renditen.
+    """
+    if prices is None or prices.empty:
+        return empty_state_html("Maximum Diversification",
+                                "No price data available.")
+    prices = prices.rename(columns=short_name)
+    benchmark_name = next((short_name(n) for i, n, _ in tickers
+                           if i == "IE00BK5BQT80"), None)
+    if benchmark_name not in prices.columns:
+        benchmark_name = None
+
+    intro = f"""
+<h2>Maximum Diversification &mdash; {DIV_N_ASSETS} assets</h2>
+<p class="note">
+ Holding no more than {DIV_N_ASSETS} funds, which ones combine into the least
+ concentrated book? Two measures are reported side by side because they answer
+ different questions:
+</p>
+<p class="note">
+ <strong>DR</strong> (diversification ratio) = weighted-average vol / portfolio vol.
+ Maximising it is mathematically the same as a minimum-variance problem in
+ <em>correlation</em> space, so it spreads <em>risk</em> rather than capital &mdash;
+ and it will happily pile into the lowest-vol asset, which is why the unconstrained
+ optimum tends to be bond-heavy.<br>
+ <strong>ENB</strong> (effective number of bets) = entropy of risk across the
+ uncorrelated principal components. This is the one that takes
+ &ldquo;as orthogonal as possible&rdquo; literally: ENB&nbsp;=&nbsp;1 means all risk
+ rides on a single factor, ENB&nbsp;=&nbsp;{DIV_N_ASSETS} means it is spread evenly
+ over {DIV_N_ASSETS} independent sources. A high DR with a low ENB is low volatility
+ concentrated in one risk source &mdash; not what you want.
+</p>
+<p class="note">
+ Weight floors matter: without one, a &ldquo;{DIV_N_ASSETS}-asset&rdquo; optimum can
+ put 2% in a holding and really be a 3-asset portfolio. The
+ <em>min&nbsp;{DIV_MIN_WEIGHT:.0%}</em> row shows what insisting on a genuine
+ {DIV_N_ASSETS}-asset book costs in DR and buys in return.
+</p>
+"""
+    panels = [_div_panel(prices, benchmark_name, yrs, label, blurb)
+              for yrs, label, blurb in DIV_PANELS]
+    return intro + "<hr style='margin:38px 0;border:none;border-top:1px solid #ddd'>".join(panels)
+
+
+def generate_report(aqr_section, etf_section, sector_section, diversification_section):
+    """Wrap four tab sections into a complete HTML page."""
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return f"""<!DOCTYPE html>
@@ -1771,6 +2104,7 @@ def generate_report(aqr_section, etf_section, sector_section):
   <button class="tab-btn active" data-tab="aqr">AQR Funds</button>
   <button class="tab-btn" data-tab="etf">Global Equity ETFs</button>
   <button class="tab-btn" data-tab="sector">Sector Performance</button>
+  <button class="tab-btn" data-tab="div">Max Diversification</button>
 </div>
 
 <div class="tab-content active" id="tab-aqr">
@@ -1783,6 +2117,10 @@ def generate_report(aqr_section, etf_section, sector_section):
 
 <div class="tab-content" id="tab-sector">
 {sector_section}
+</div>
+
+<div class="tab-content" id="tab-div">
+{diversification_section}
 </div>
 
 <script>
@@ -1891,8 +2229,14 @@ def main():
     etf_section = build_etf_section(etf_prices, etf_prices_raw, etf_returns, etf_tickers)
     print("  Building Sector section...")
     sector_section = build_sector_section()
+    print("  Building Max Diversification section...")
+    try:
+        div_section = build_diversification_section(aqr_prices_raw, aqr_tickers)
+    except Exception as exc:
+        print(f"  ! Max Diversification skipped: {exc}")
+        div_section = empty_state_html("Maximum Diversification", str(exc))
 
-    html = generate_report(aqr_section, etf_section, sector_section)
+    html = generate_report(aqr_section, etf_section, sector_section, div_section)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n  Report: {output_path}")
