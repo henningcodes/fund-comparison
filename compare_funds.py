@@ -751,8 +751,12 @@ def stress_test_html(stress_df, benchmark_short):
     return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def correlation_heatmap(prices):
-    """Correlation matrix heatmap of daily returns."""
+def correlation_heatmap(prices, first=None):
+    """Correlation matrix heatmap of daily returns.
+
+    first: Spalte, die vorne stehen soll (Benchmark). Sonst folgt die Reihenfolge
+    der Ticker-CSV, und der Vergleichsmassstab landet irgendwo in der Mitte.
+    """
     rets = prices.pct_change().dropna(how="all")
     if rets.empty:
         return None
@@ -766,6 +770,10 @@ def correlation_heatmap(prices):
     corr = corr.loc[valid_cols, valid_cols]
     if corr.empty:
         return None
+
+    if first in corr.columns:
+        order = [first] + [c for c in corr.columns if c != first]
+        corr = corr.loc[order, order]
 
     labels = [short_name(c) for c in corr.columns]
 
@@ -1492,7 +1500,7 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     fig1 = performance_chart(prices)
     fig1n = vol_normalized_chart(prices)
     fig2 = rolling_correlation_chart(prices_raw, aqr_names, benchmark_name) if benchmark_name else None
-    fig3 = correlation_heatmap(prices_raw)
+    fig3 = correlation_heatmap(prices_raw, first=benchmark_name)
     fig4 = return_dendrogram(prices_raw)
     stress_df = stress_test_table(prices_raw, benchmark_name) if benchmark_name else None
     port_weights, port_curves, port_stats = optimize_portfolios(
