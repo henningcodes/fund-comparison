@@ -75,6 +75,7 @@ SHORT_NAMES = {
     "UBS Carry": "UBS Carry",
     "Invesco Physical Gold": "Gold",
     "Global Aggregate Bond UCITS EUR Hedged": "Global Agg Bond",
+    "CFM Cumulus": "CFM Cumulus",
     # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
     # Global equity ETFs
@@ -1716,6 +1717,10 @@ DIV_PANELS = [
                          "actually speaks to crisis behaviour"),
     (2.0, "Recent window", "more funds qualify, but the window contains no crisis - "
                            "treat the correlations as fair-weather estimates"),
+    (0.8, "All funds", "every fund qualifies, including the newest launches - but "
+                       "the common window is under a year, so there are barely more "
+                       "observations than the covariance matrix has parameters. "
+                       "Indicative only; do not size a portfolio off this panel alone"),
 ]
 
 
