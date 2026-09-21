@@ -74,7 +74,7 @@ SHORT_NAMES = {
     # Other AQR-tab non-AQR funds
     "UBS Carry": "UBS Carry",
     "Invesco Physical Gold": "Gold",
-    "Global Aggregate Bond UCITS EUR Hedged": "Global Agg Bond",
+    "Global Aggregate Bond UCITS ETF USD Hedged": "Global Agg Bond USD-H",
     "CFM Cumulus": "CFM Cumulus",
     # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
@@ -234,17 +234,45 @@ def trim_broken_history(prices, threshold=TRIM_BREAK,
     return out
 
 
+# Funds that must NOT be looked up by ISIN: {isin: (yahoo_symbol, currency)}.
+# yfinance resolves an ISIN through Yahoo's search and takes whichever listing
+# comes back first. For the previous bond fund (IE00BDBRDM35) that was a London
+# line whose history Yahoo repeatedly cut to a single day (Aug/Sep 2026), which
+# shrank every chart to that one day. For QDVJ it is AGGU.L, quoted in USD.
+#
+# QDVJ's Xetra line is not on Yahoo, and the Munich line QDVJ.MU is useless:
+# ~15% stale days, twice the true volatility. So take the clean USD line in
+# London and convert it to EUR -- checked against Bloomberg's QDVJ GR: +13.1%
+# vs +13.2% since 2019. Small timing mismatch: LSE closes 16:30 London, the FX
+# close is later.
+YAHOO_SYMBOLS = {
+    "IE00BZ043R46": ("AGGU.L", "USD"),   # iShares Core Global Agg Bond USD Hdg (Acc)
+}
+
+
+def usd_to_eur(series):
+    """Convert a USD price series to EUR with Yahoo's EURUSD daily close."""
+    fx = yf.Ticker("EURUSD=X").history(period="max")["Close"].dropna()
+    fx.index = fx.index.tz_localize(None).normalize()
+    fx = fx[~fx.index.duplicated(keep="last")].sort_index()
+    rate = fx.reindex(series.index.normalize(), method="ffill").to_numpy()
+    return (series / rate).dropna()
+
+
 def download_prices(tickers):
-    """Download daily close prices via yfinance using ISINs."""
+    """Download daily close prices via yfinance using ISINs (or YAHOO_SYMBOLS)."""
     all_prices = {}
     for isin, name, _ in tickers:
+        symbol, currency = YAHOO_SYMBOLS.get(isin, (isin, "EUR"))
         print(f"  {isin}  {short_name(name):25s}", end="", flush=True)
         try:
-            tk = yf.Ticker(isin)
+            tk = yf.Ticker(symbol)
             hist = tk.history(period="max")
             if not hist.empty and "Close" in hist.columns:
                 series = hist["Close"].dropna()
                 series.index = series.index.tz_localize(None)
+                if currency == "USD":
+                    series = usd_to_eur(series)
                 all_prices[name] = series
                 print(f"  {len(series):5d} days  ({series.index.min().date()} -> {series.index.max().date()})")
             else:
@@ -254,6 +282,24 @@ def download_prices(tickers):
     px = despike(pd.DataFrame(all_prices))
     print("  Trimming unrepairable history:")
     return trim_broken_history(px)
+
+
+MIN_CHART_DAYS = 60   # fewer real prices than this: performance table only
+
+
+def chart_columns(prices_raw, min_days=MIN_CHART_DAYS):
+    """Funds with enough history to go into the charts and analytics.
+
+    Every chart starts at the LATEST first date across its funds, and the
+    optimizers only use days on which all funds have a price. One fund that
+    comes back from Yahoo with a single price therefore shrinks all charts to
+    that one day and they render empty. Such a fund keeps its row in the
+    performance table but stays out of everything else.
+    """
+    counts = prices_raw.notna().sum()
+    for col in counts.index[counts < min_days]:
+        print(f"  ! {short_name(col)}: only {counts[col]} day(s) of prices -- left out of the charts")
+    return list(counts.index[counts >= min_days])
 
 
 # ---------------------------------------------------------------------------
@@ -2237,14 +2283,18 @@ def main():
         etf_returns = compute_returns_table(etf_prices, etf_last_valid)
 
     print("\n  Building AQR section...")
-    aqr_section = build_aqr_section(aqr_prices, aqr_prices_raw, aqr_returns, aqr_tickers)
+    aqr_cols = chart_columns(aqr_prices_raw)
+    aqr_section = build_aqr_section(aqr_prices[aqr_cols], aqr_prices_raw[aqr_cols],
+                                    aqr_returns, aqr_tickers)
     print("  Building ETF section...")
-    etf_section = build_etf_section(etf_prices, etf_prices_raw, etf_returns, etf_tickers)
+    etf_cols = chart_columns(etf_prices_raw)
+    etf_section = build_etf_section(etf_prices[etf_cols], etf_prices_raw[etf_cols],
+                                    etf_returns, etf_tickers)
     print("  Building Sector section...")
     sector_section = build_sector_section()
     print("  Building Max Diversification section...")
     try:
-        div_section = build_diversification_section(aqr_prices_raw, aqr_tickers)
+        div_section = build_diversification_section(aqr_prices_raw[aqr_cols], aqr_tickers)
     except Exception as exc:
         print(f"  ! Max Diversification skipped: {exc}")
         div_section = empty_state_html("Maximum Diversification", str(exc))
