@@ -25,6 +25,7 @@ Tab 3 – Sector Performance:
 """
 
 import datetime as dt
+import functools
 import os
 import sys
 from itertools import combinations
@@ -72,9 +73,9 @@ SHORT_NAMES = {
     "MANAGED FUTURES": "AQR Managed Futures",
     "Delphi Long-Short": "AQR Delphi L/S",
     # Other AQR-tab non-AQR funds
-    "UBS Carry": "UBS Carry",
-    "Invesco Physical Gold": "Gold",
-    "Global Aggregate Bond UCITS ETF USD Hedged": "Global Agg Bond USD-H",
+    "Enhanced Commodity Carry": "Commodity Carry",
+    "Xetra-Gold": "Gold",
+    "Global Aggregate Bond UCITS ETF EUR Hedged": "Global Agg Bond EUR-H",
     "CFM Cumulus": "CFM Cumulus",
     # Benchmark
     "Vanguard FTSE All World": "FTSE All World",
@@ -109,7 +110,7 @@ def empty_state_html(title, message):
 
 DESPIKE_SIGMA = 10.0     # one-day excursion in robust daily sigmas of that fund
 DESPIKE_MIN_REL = 0.03   # ...and at least 3% in absolute terms
-DESPIKE_REVERT = 0.015   # ...and the two neighbours must agree within 1.5%
+DESPIKE_REVERT = 0.015   # ...and the two neighbours must agree within 1.5% (or 2 sigma)
 
 
 def despike(prices, n_sigma=DESPIKE_SIGMA, min_rel=DESPIKE_MIN_REL,
@@ -129,8 +130,12 @@ def despike(prices, n_sigma=DESPIKE_SIGMA, min_rel=DESPIKE_MIN_REL,
          volatility (MAD of returns x 1.4826).
       2. It must also be at least min_rel in absolute terms, so a fund in a
          dead-calm stretch does not get shredded by rounding noise.
-      3. The neighbours must agree with each other within revert -- a bad print
-         leaves no trace, the market resumes exactly where it left off.
+      3. The neighbours must agree with each other within revert, or within 2
+         robust sigmas for a volatile fund -- a bad print leaves no trace, the
+         market resumes where it left off. The neighbours are two trading days
+         apart, so a genuine move between them is of order sqrt(2) sigma; a flat
+         1.5% held EM (~1% daily vol) to the standard of a calm fund and missed
+         XMME.DE 2025-10-24, where Yahoo stored the USD price on the EUR line.
 
     Why the neighbour average rather than a rolling median: it separates the
     two cases by orders of magnitude. On this data the real bad prints are
@@ -163,7 +168,7 @@ def despike(prices, n_sigma=DESPIKE_SIGMA, min_rel=DESPIKE_MIN_REL,
         prv, nxt = s.shift(1), s.shift(-1)
         ref = (prv + nxt) / 2.0
         excursion = (s / ref - 1).abs()
-        neighbours_agree = (prv / nxt - 1).abs() < revert
+        neighbours_agree = (prv / nxt - 1).abs() < max(revert, 2 * sigma)
         bad = ((excursion > n_sigma * sigma)
                & (excursion > min_rel)
                & neighbours_agree).fillna(False)
@@ -197,7 +202,8 @@ def trim_broken_history(prices, threshold=TRIM_BREAK,
     print as its neighbour: the "neighbours agree" test fails, and worse, a
     GOOD price sandwiched between two bad ones gets flagged instead.
 
-    MSCI Japan is the live example: 92 daily moves beyond 15% between
+    MSCI Japan was the example while it came from London (IJPA.L; the Xetra
+    line EUNN.DE is clean): 92 daily moves beyond 15% between
     2009-11 and 2010-12 (the quote alternates between roughly 17 and 25 --
     a currency mix-up in the source), then nothing at all. From 2011-01 the
     series is spotless at 17.6% vol; before that it is unusable at ~50%.
@@ -234,36 +240,53 @@ def trim_broken_history(prices, threshold=TRIM_BREAK,
     return out
 
 
-# Funds that must NOT be looked up by ISIN: {isin: (yahoo_symbol, currency)}.
+# Funds that must NOT be looked up by ISIN: {isin: yahoo_symbol}.
 # yfinance resolves an ISIN through Yahoo's search and takes whichever listing
-# comes back first. For the previous bond fund (IE00BDBRDM35) that was a London
-# line whose history Yahoo repeatedly cut to a single day (Aug/Sep 2026), which
-# shrank every chart to that one day. For QDVJ it is AGGU.L, quoted in USD.
-#
-# QDVJ's Xetra line is not on Yahoo, and the Munich line QDVJ.MU is useless:
-# ~15% stale days, twice the true volatility. So take the clean USD line in
-# London and convert it to EUR -- checked against Bloomberg's QDVJ GR: +13.1%
-# vs +13.2% since 2019. Small timing mismatch: LSE closes 16:30 London, the FX
-# close is later.
+# comes back first -- often a London line in USD (FTSE All World -> VWRA.L), or
+# one with a broken history: for the EUR-hedged Global Agg Bond it was a London
+# line that Yahoo repeatedly cut to a single day (Aug/Sep 2026). So pin the
+# Xetra line in EUR for every exchange-traded fund: one currency, and one
+# closing time, which keeps the daily correlations clean. The AQR and CFM
+# mutual funds resolve to their EUR NAV and need no entry.
 YAHOO_SYMBOLS = {
-    "IE00BZ043R46": ("AGGU.L", "USD"),   # iShares Core Global Agg Bond USD Hdg (Acc)
+    "IE00BK5BQT80": "VWCE.DE",   # Vanguard FTSE All World (Acc)
+    "IE00B4L5Y983": "EUNL.DE",   # iShares Core MSCI World
+    "IE00BJ0KDR00": "XD9U.DE",   # Xtrackers MSCI USA
+    "IE00B4K48X80": "EUNK.DE",   # iShares Core MSCI Europe
+    "IE00BTJRMP35": "XMME.DE",   # Xtrackers MSCI Emerging Markets
+    "IE00B4L5YX21": "EUNN.DE",   # iShares Core MSCI Japan IMI
+    "IE00B52MJY50": "SXR1.DE",   # iShares Core MSCI Pacific ex-Japan
+    "DE000A0S9GB0": "4GLD.DE",   # Xetra-Gold
+    "IE00BDBRDM35": "EUNA.DE",   # iShares Core Global Agg Bond EUR Hdg (Acc)
+    # WisdomTree Enhanced Commodity Carry. The Milan line CRRY.MI has ~7% stale
+    # days and a +16%/-14% bad print on 2025-10-24; Xetra is clean.
+    "XS3022291473": "CRRY.DE",
 }
+
+
+@functools.cache
+def _eurusd():
+    fx = yf.Ticker("EURUSD=X").history(period="max")["Close"].dropna()
+    fx.index = fx.index.tz_localize(None).normalize()
+    return fx[~fx.index.duplicated(keep="last")].sort_index()
 
 
 def usd_to_eur(series):
     """Convert a USD price series to EUR with Yahoo's EURUSD daily close."""
-    fx = yf.Ticker("EURUSD=X").history(period="max")["Close"].dropna()
-    fx.index = fx.index.tz_localize(None).normalize()
-    fx = fx[~fx.index.duplicated(keep="last")].sort_index()
-    rate = fx.reindex(series.index.normalize(), method="ffill").to_numpy()
+    rate = _eurusd().reindex(series.index.normalize(), method="ffill").to_numpy()
     return (series / rate).dropna()
 
 
 def download_prices(tickers):
-    """Download daily close prices via yfinance using ISINs (or YAHOO_SYMBOLS)."""
+    """Download daily close prices in EUR via yfinance using ISINs (or YAHOO_SYMBOLS).
+
+    All analytics compare funds against each other, so every series must be in
+    the same currency. The currency Yahoo reports for the chosen listing decides:
+    USD lines are converted to EUR, anything else that is not EUR is flagged.
+    """
     all_prices = {}
     for isin, name, _ in tickers:
-        symbol, currency = YAHOO_SYMBOLS.get(isin, (isin, "EUR"))
+        symbol = YAHOO_SYMBOLS.get(isin, isin)
         print(f"  {isin}  {short_name(name):25s}", end="", flush=True)
         try:
             tk = yf.Ticker(symbol)
@@ -271,10 +294,16 @@ def download_prices(tickers):
             if not hist.empty and "Close" in hist.columns:
                 series = hist["Close"].dropna()
                 series.index = series.index.tz_localize(None)
+                currency = (tk.history_metadata or {}).get("currency", "?")
+                note = currency
                 if currency == "USD":
                     series = usd_to_eur(series)
+                    note = "USD -> EUR"
+                elif currency != "EUR":
+                    note = f"{currency}  ! NOT EUR, left unconverted"
                 all_prices[name] = series
-                print(f"  {len(series):5d} days  ({series.index.min().date()} -> {series.index.max().date()})")
+                print(f"  {len(series):5d} days  ({series.index.min().date()} -> {series.index.max().date()})"
+                      f"  {symbol} {note}")
             else:
                 print("  NO DATA")
         except Exception as e:
