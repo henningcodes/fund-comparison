@@ -7,7 +7,7 @@ and ETFs in etfs.csv, generates an HTML report with three tabs:
 Tab 1 – AQR Funds:
 - Performance table (1M, 3M, 1Y, Max returns)
 - Indexed performance chart
-- Correlation matrix (daily returns)
+- Correlation matrices (daily and weekly returns)
 - Hierarchical clustering dendrogram
 - Rolling correlation with FTSE All World
 - Stress test (worst weeks)
@@ -797,12 +797,18 @@ def stress_test_html(stress_df, benchmark_short):
     return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def correlation_heatmap(prices, first=None):
-    """Correlation matrix heatmap of daily returns.
+def correlation_heatmap(prices, first=None, weekly=False):
+    """Correlation matrix heatmap of daily (or weekly) returns.
 
     first: Spalte, die vorne stehen soll (Benchmark). Sonst folgt die Reihenfolge
     der Ticker-CSV, und der Vergleichsmassstab landet irgendwo in der Mitte.
+    weekly: Freitag-auf-Freitag-Renditen statt Tagesrenditen. Wird der NAV zu
+    unterschiedlichen Zeiten festgestellt (US- vs. Europa-Schluss) oder fehlen
+    einzelne Kurstage, verzerrt das die Tageskorrelation; auf Wochenbasis faellt
+    das kaum ins Gewicht.
     """
+    if weekly:
+        prices = prices.resample("W-FRI").last()
     rets = prices.pct_change().dropna(how="all")
     if rets.empty:
         return None
@@ -822,15 +828,22 @@ def correlation_heatmap(prices, first=None):
         corr = corr.loc[order, order]
 
     labels = [short_name(c) for c in corr.columns]
+    # Paarweise Anzahl gemeinsamer Renditen fuer den Hover: auf Wochenbasis stuetzt
+    # sich ein junger Fonds oft nur auf wenige Dutzend Beobachtungen.
+    has_ret = rets[corr.columns].notna().astype(int)
+    n_obs = has_ret.T @ has_ret
+    unit = "weeks" if weekly else "days"
 
     fig = go.Figure(go.Heatmap(
         z=corr.values, x=labels, y=labels,
         colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
         text=[[f"{v:.2f}" for v in row] for row in corr.values],
         texttemplate="%{text}", textfont=dict(size=12),
+        customdata=n_obs.values,
+        hovertemplate=f"%{{y}} / %{{x}}: %{{z:.2f}}<br>%{{customdata}} {unit}<extra></extra>",
     ))
     fig.update_layout(
-        title="Correlation Matrix (Daily Returns)",
+        title=f"Correlation Matrix ({'Weekly' if weekly else 'Daily'} Returns)",
         template="plotly_white", height=550, width=750,
     )
     return fig
@@ -1547,6 +1560,7 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     fig1n = vol_normalized_chart(prices)
     fig2 = rolling_correlation_chart(prices_raw, aqr_names, benchmark_name) if benchmark_name else None
     fig3 = correlation_heatmap(prices_raw, first=benchmark_name)
+    fig3w = correlation_heatmap(prices_raw, first=benchmark_name, weekly=True)
     fig4 = return_dendrogram(prices_raw)
     stress_df = stress_test_table(prices_raw, benchmark_name) if benchmark_name else None
     port_weights, port_curves, port_stats = optimize_portfolios(
@@ -1561,6 +1575,7 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
     c1n = fig1n.to_html(full_html=False, include_plotlyjs=False) if fig1n else ""
     c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
     c3 = fig3.to_html(full_html=False, include_plotlyjs=False) if fig3 else ""
+    c3w = fig3w.to_html(full_html=False, include_plotlyjs=False) if fig3w else ""
     c4 = fig4.to_html(full_html=False, include_plotlyjs=False) if fig4 else ""
     c5 = fig5.to_html(full_html=False, include_plotlyjs=False) if fig5 else ""
 
@@ -1594,10 +1609,17 @@ def build_aqr_section(prices, prices_raw, returns_table, tickers):
             f"<p class=\"note\">{funding_range_note(prices)}</p>",
             f'<div class="chart-box">{c1n}</div>',
         ])
+    if c3 or c3w:
+        sections.append("<h2>Correlation Matrix</h2>")
     if c3:
+        sections.append(f'<div class="chart-box">{c3}</div>')
+    if c3w:
         sections.extend([
-            "<h2>Correlation Matrix</h2>",
-            f'<div class="chart-box">{c3}</div>',
+            "<p class=\"note\">The same matrix from Friday-to-Friday returns. NAVs struck at "
+            "different times (US vs. European close) and missing price days distort daily "
+            "correlations; over a week that timing gap barely matters and single-day noise "
+            "averages out. Hover shows how many weeks each value rests on.</p>",
+            f'<div class="chart-box">{c3w}</div>',
         ])
     if c4:
         sections.extend([
@@ -1660,6 +1682,7 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     fig_corr_bar = correlation_vs_benchmark_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
     fig2 = rolling_correlation_chart(prices_raw, etf_names, benchmark_name) if benchmark_name else None
     fig3 = correlation_heatmap(prices_raw)
+    fig3w = correlation_heatmap(prices_raw, weekly=True)
     fig4 = return_dendrogram(prices_raw)
     stress_df = stress_test_table(prices_raw, benchmark_name) if benchmark_name else None
     port_weights, port_curves, port_stats = optimize_portfolios_free(
@@ -1675,6 +1698,7 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
     c_bar = fig_corr_bar.to_html(full_html=False, include_plotlyjs=False) if fig_corr_bar else ""
     c2 = fig2.to_html(full_html=False, include_plotlyjs=False) if fig2 else ""
     c3 = fig3.to_html(full_html=False, include_plotlyjs=False) if fig3 else ""
+    c3w = fig3w.to_html(full_html=False, include_plotlyjs=False) if fig3w else ""
     c4 = fig4.to_html(full_html=False, include_plotlyjs=False) if fig4 else ""
     c5 = fig5.to_html(full_html=False, include_plotlyjs=False) if fig5 else ""
 
@@ -1715,10 +1739,17 @@ def build_etf_section(prices, prices_raw, returns_table, etf_tickers):
             f"<p class=\"note\">{funding_range_note(prices)}</p>",
             f'<div class="chart-box">{c1n}</div>',
         ])
+    if c3 or c3w:
+        sections.append("<h2>Correlation Matrix</h2>")
     if c3:
+        sections.append(f'<div class="chart-box">{c3}</div>')
+    if c3w:
         sections.extend([
-            "<h2>Correlation Matrix</h2>",
-            f'<div class="chart-box">{c3}</div>',
+            "<p class=\"note\">The same matrix from Friday-to-Friday returns. NAVs struck at "
+            "different times (US vs. European close) and missing price days distort daily "
+            "correlations; over a week that timing gap barely matters and single-day noise "
+            "averages out. Hover shows how many weeks each value rests on.</p>",
+            f'<div class="chart-box">{c3w}</div>',
         ])
     if c4:
         sections.extend([
