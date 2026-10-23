@@ -246,9 +246,13 @@ def trim_broken_history(prices, threshold=TRIM_BREAK,
 # one with a broken history: for the EUR-hedged Global Agg Bond it was a London
 # line that Yahoo repeatedly cut to a single day (Aug/Sep 2026). So pin the
 # Xetra line in EUR for every exchange-traded fund: one currency, and one
-# closing time, which keeps the daily correlations clean. The AQR and CFM
-# mutual funds resolve to their EUR NAV and need no entry.
+# closing time, which keeps the daily correlations clean. The mutual funds
+# resolve to their EUR NAV via the ISIN; Apex and Delphi are pinned to the
+# share class chosen in tickerlist.csv.
 YAHOO_SYMBOLS = {
+    "LU2793907507": "0P0001T8MO.F",   # AQR Apex RAE1 EUR Acc
+    "LU1842779214": "0P0001DW64.F",   # AQR Delphi Long-Short RAE
+
     "IE00BK5BQT80": "VWCE.DE",   # Vanguard FTSE All World (Acc)
     "IE00B4L5Y983": "EUNL.DE",   # iShares Core MSCI World
     "IE00BJ0KDR00": "XD9U.DE",   # Xtrackers MSCI USA
